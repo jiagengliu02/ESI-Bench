@@ -25,6 +25,7 @@ sys.path.insert(0, str(ACTIVE_EXPLORE_DIR))
 
 import omnigibson as og  # noqa: E402
 from omnigibson.macros import gm  # noqa: E402
+from omnigibson.sensors.vision_sensor import VisionSensor  # noqa: E402
 from scipy.spatial.transform import Rotation  # noqa: E402
 
 
@@ -271,8 +272,39 @@ def set_viewer_camera_fov(fov_deg: float | None) -> None:
     cam = getattr(og.sim, "viewer_camera", None) or getattr(og.sim, "_viewer_camera", None)
     if cam is None:
         return
-    aperture_mm = float(cam.horizontal_aperture)
-    cam.focal_length = aperture_mm / (2.0 * math.tan(math.radians(float(fov_deg)) * 0.5))
+    set_camera_fov(cam, fov_deg)
+
+
+def set_camera_fov(cam, fov_deg: float | None) -> None:
+    if cam is None or fov_deg is None:
+        return
+    try:
+        aperture_mm = float(cam.horizontal_aperture)
+        cam.focal_length = aperture_mm / (2.0 * math.tan(math.radians(float(fov_deg)) * 0.5))
+    except Exception:
+        pass
+
+
+def preferred_camera_fov(payload: dict[str, Any] | None, args: argparse.Namespace) -> float | None:
+    if args.fov_deg is not None:
+        return float(args.fov_deg)
+    if isinstance(payload, dict):
+        camera_setup = payload.get("camera_setup") or {}
+        value = camera_setup.get("fov_deg")
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+        render = payload.get("render") or {}
+        main_view = render.get("main_view") or {}
+        value = main_view.get("fov_deg")
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+    return None
 
 
 def initial_camera(payload: dict[str, Any] | None, task_module, args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray]:
@@ -1108,10 +1140,39 @@ def rgb_obs_to_uint8(frame: Any) -> np.ndarray:
     return image
 
 
-def capture_rgb(render_frames: int = 4) -> np.ndarray:
+def create_video_capture_camera(width: int = 1280, height: int = 720) -> VisionSensor:
+    camera = VisionSensor(
+        relative_prim_path="/video_capture_camera",
+        name="video_capture_camera",
+        modalities=["rgb"],
+        image_height=int(height),
+        image_width=int(width),
+        clipping_range=(0.001, 1000.0),
+        viewport_name=None,
+    )
+    camera.load(None)
+    camera.initialize()
+    try:
+        camera.initialize_sensors(names=["rgb"])
+    except Exception:
+        pass
+    try:
+        camera.clipping_range = th.tensor([0.001, 1000.0], dtype=th.float32)
+    except Exception:
+        pass
+    for _ in range(4):
+        try:
+            og.sim.render()
+        except Exception:
+            break
+    return camera
+
+
+def capture_rgb(camera, render_frames: int = 4) -> np.ndarray:
     for _ in range(max(int(render_frames), 1)):
         og.sim.render()
-    return rgb_obs_to_uint8(og.sim._viewer_camera.get_obs()[0]["rgb"])
+    obs, _info = camera.get_obs()
+    return rgb_obs_to_uint8(obs["rgb"])
 
 
 def make_writer(path: Path, fps: float, width: int, height: int) -> cv2.VideoWriter:
@@ -1209,7 +1270,7 @@ def record_interactive(
                 position=th.tensor(pos, dtype=th.float32),
                 orientation=th.tensor(quat, dtype=th.float32),
             )
-            rgb = capture_rgb()
+            rgb = capture_rgb(og.sim._viewer_camera)
             if (rgb.shape[1], rgb.shape[0]) != (out_width, out_height):
                 rgb = cv2.resize(rgb, (out_width, out_height), interpolation=cv2.INTER_AREA)
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
@@ -1273,6 +1334,7 @@ def main() -> int:
     config = build_env_config(scene, room, args.robot, objects, full_scene=full_scene, args=args)
 
     env = None
+    video_capture_camera = None
     try:
         log(f"loading scene={scene} room={room} full_scene={full_scene}")
         env = og.Environment(configs=config)
@@ -1332,17 +1394,17 @@ def main() -> int:
             args,
             target,
         )
-        log("setting initial viewer camera")
-        og.sim._viewer_camera.set_position_orientation(
+        capture_width = args.width or 1280
+        capture_height = args.height or 720
+        video_capture_camera = create_video_capture_camera(width=capture_width, height=capture_height)
+        set_camera_fov(video_capture_camera, preferred_camera_fov(payload, args))
+        log("setting initial video capture camera")
+        video_capture_camera.set_position_orientation(
             position=th.tensor(first_pos, dtype=th.float32),
             orientation=th.tensor(first_quat, dtype=th.float32),
         )
         log("capturing first frame")
-        # try:
-        #     og.sim.stop()
-        # except Exception:
-        #     pass
-        first_rgb = capture_rgb()
+        first_rgb = capture_rgb(video_capture_camera)
         log(f"first frame captured shape={first_rgb.shape}")
         height, width = first_rgb.shape[:2]
         out_width = args.width or width
@@ -1366,11 +1428,11 @@ def main() -> int:
                     args,
                     target,
                 )
-                og.sim._viewer_camera.set_position_orientation(
+                video_capture_camera.set_position_orientation(
                     position=th.tensor(frame_pos, dtype=th.float32),
                     orientation=th.tensor(frame_quat, dtype=th.float32),
                 )
-                rgb = capture_rgb()
+                rgb = capture_rgb(video_capture_camera)
                 if (rgb.shape[1], rgb.shape[0]) != (out_width, out_height):
                     rgb = cv2.resize(rgb, (out_width, out_height), interpolation=cv2.INTER_AREA)
                 rgb = annotate_frame(rgb, args, demo_state, frame, args.frames)
@@ -1380,6 +1442,11 @@ def main() -> int:
         print(json.dumps({"output": str(args.output.resolve()), "frames": args.frames, "fps": args.fps}, indent=2))
         return 0
     finally:
+        if video_capture_camera is not None:
+            try:
+                video_capture_camera.remove()
+            except Exception:
+                pass
         if env is not None:
             try:
                 og.shutdown()
