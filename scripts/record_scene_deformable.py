@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=None, help="Optional output width.")
     parser.add_argument("--height", type=int, default=None, help="Optional output height.")
     parser.add_argument("--robot", default="R1")
-    parser.add_argument("--full-scene", action="store_true", help="Load full scene instead of a single room.")
+    parser.add_argument("--full-scene", default=True, action="store_true", help="Load full scene instead of a single room.")
     parser.add_argument("--room-only", action="store_true", help="Ignore a task module's FULL_SCENE default and load only --room / metadata room.")
     parser.add_argument("--hide-ceilings", action="store_true", help="Do not load ceilings.")
     parser.add_argument("--hide-walls", action="store_true", help="Do not load walls.")
@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
             "unobserved-phases",
             "counting-scan",
         ],
-        default="task-demo",
+        default="none",
     )
     parser.add_argument("--orbit-radius", type=float, default=1.0)
     parser.add_argument("--orbit-deg", type=float, default=180.0)
@@ -1297,7 +1297,7 @@ def main() -> int:
             pos, quat = initial_camera(payload, task_module, args)
             log("task setup complete")
 
-        set_viewer_camera_fov(args.fov_deg)
+        # set_viewer_camera_fov(args.fov_deg)
         target, target_source = target_from_payload(payload, args)
         demo_state = prepare_task_demo(env, task_module, payload, task_state, args)
         if args.motion in {"target-orbit", "counting-scan"}:
