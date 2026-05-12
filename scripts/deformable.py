@@ -32,10 +32,6 @@ TASK_NAME = "deformable"
 DEFAULT_MODEL = "gemini-2.5-flash"
 DISABLE_VIEWER_CAMERA_MODALITIES = True
 SKIP_INITIAL_SETTLE = True
-DEFAULT_METADATA_PATH = Path("json-tmp/deformable/cover_small_item_cloth/Ihlen_1_int/bedroom_1/q_001.json")
-DEFAULT_SCENE = "Ihlen_1_int"
-DEFAULT_ROOM = "bedroom_1"
-DEFAULT_OUTPUT_PATH = Path("outputs/qualitative_task_demo/videos/deformable_unveil_bottle_Ihlen_1_int_bedroom_1_q001.mp4")
 
 RENDER_OBJECT_PREFIX = "cover_small_item_render_"
 DEFAULT_TASK_TYPE = "cover_small_item_cloth"
@@ -345,7 +341,7 @@ def _snapshot_object_state(obj) -> dict[str, Any]:
 
 
 def scene_room(payload: dict[str, Any]) -> tuple[str, str]:
-    return normalize_text(payload.get("scene")) or DEFAULT_SCENE, normalize_text(payload.get("room")) or DEFAULT_ROOM
+    return normalize_text(payload.get("scene")), normalize_text(payload.get("room")) or "scene_wide"
 
 
 def question_id(payload: dict[str, Any], source_path: Path) -> str:
