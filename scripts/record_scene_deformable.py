@@ -529,6 +529,27 @@ def set_object_pose(scene, name: str | None, pos: np.ndarray, quat: np.ndarray |
         pass
 
 
+def remove_object_by_name(scene, name: str | None, render_frames: int = 5) -> bool:
+    if not name:
+        return False
+    try:
+        obj = scene.object_registry("name", name)
+    except Exception:
+        obj = None
+    if obj is None:
+        return False
+    try:
+        scene.remove_object(obj)
+    except Exception:
+        return False
+    for _ in range(max(int(render_frames), 0)):
+        try:
+            og.sim.render()
+        except Exception:
+            break
+    return True
+
+
 def runtime_name_by_prefix(task_state: dict[str, Any], prefix: str) -> str | None:
     for name in task_state.get("dynamic_object_names") or []:
         if str(name).startswith(prefix):
@@ -905,18 +926,14 @@ def prepare_task_demo(
     if args.motion == "deformable-unveil":
         item_target = item_target_from_runtime(env, payload, task_state)
         cloth_name = runtime_name_by_prefix(task_state, "cover_small_item_render_cloth_")
-        cloth_pose = object_pose(env.scene, cloth_name)
         cloth_center = as_vec3(nested_get(task_state, "cloth_after_settle", "bbox", "center"))
         if item_target is not None:
             state["target"] = item_target
         if cloth_center is not None and item_target is not None and np.linalg.norm(cloth_center[:2] - item_target[:2]) < 1.0:
             state["target"] = (np.array(state.get("target", cloth_center), dtype=float) + cloth_center) * 0.5
-        if cloth_name and cloth_pose is not None:
+        if cloth_name:
             state["cloth_name"] = cloth_name
-            state["cloth_start_pos"] = cloth_pose[0]
-            state["cloth_quat"] = cloth_pose[1]
-            lift = np.array([0.55, -0.35, 0.9], dtype=float)
-            state["cloth_end_pos"] = cloth_pose[0] + lift
+            state["cloth_removed"] = False
         log(f"deformable-unveil target={state.get('target')} cloth={cloth_name}")
     elif args.motion == "unobserved-phases":
         first_phase = 2 if args.unobserved_phase == "phase2" else 1
@@ -973,11 +990,9 @@ def deformable_unveil_frame(
             angle=math.radians(-90.0),
             look_height=0.35,
         )
-    if "cloth_name" in state and "cloth_start_pos" in state and "cloth_end_pos" in state:
-        local = min(max((frame - approach_frames) / float(unveil_frames), 0.0), 1.0)
-        eased = ease_in_out(local)
-        cloth_pos = np.array(state["cloth_start_pos"], dtype=float) * (1.0 - eased) + np.array(state["cloth_end_pos"], dtype=float) * eased
-        set_object_pose(env.scene, state.get("cloth_name"), cloth_pos, state.get("cloth_quat"))
+    if frame >= approach_frames and state.get("cloth_name") and not bool(state.get("cloth_removed")):
+        removed = remove_object_by_name(env.scene, state.get("cloth_name"))
+        state["cloth_removed"] = bool(removed)
     end_pos, _ = approach_target_pose(
         pos,
         quat,
