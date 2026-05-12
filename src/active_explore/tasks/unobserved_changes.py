@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import math
 import re
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
+import omnigibson as og
+import omnigibson.object_states as object_states
+import torch as th
+from omnigibson.objects.dataset_object import DatasetObject
 
 from utils import normalize_text, resolve_path
 
@@ -87,6 +93,173 @@ def question_id(payload: dict[str, Any], source_path: Path) -> str:
 
 def build_env_objects(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return []
+
+
+def _step_sim(steps: int) -> None:
+    for _ in range(max(int(steps), 0)):
+        og.sim.step()
+
+
+def _set_viewer_camera_fov(fov_deg: float) -> None:
+    cam = getattr(og.sim, "viewer_camera", None) or getattr(og.sim, "_viewer_camera", None)
+    if cam is None:
+        return
+    try:
+        aperture_mm = float(cam.horizontal_aperture)
+        cam.focal_length = aperture_mm / (2.0 * math.tan(math.radians(float(fov_deg)) * 0.5))
+    except Exception:
+        pass
+
+
+def _capture_view(path: Path, pose: dict[str, Any], fov_deg: float | None = None) -> Path:
+    if fov_deg is not None:
+        _set_viewer_camera_fov(float(fov_deg))
+    og.sim._viewer_camera.set_position_orientation(
+        position=th.tensor(pose["position"], dtype=th.float32),
+        orientation=th.tensor(pose["quaternion_xyzw"], dtype=th.float32),
+    )
+    for _ in range(10):
+        og.sim.render()
+    obs = og.sim._viewer_camera.get_obs()[0]
+    rgb = obs["rgb"].detach().cpu().numpy()[:, :, :3].astype(np.uint8)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    return path
+
+
+def _remove_scene_object(scene, name: str) -> None:
+    obj = scene.object_registry("name", name) if name else None
+    if obj is None:
+        return
+    try:
+        scene.remove_object(obj)
+    except Exception:
+        pass
+
+
+def _add_dataset_object(
+    scene,
+    *,
+    name: str,
+    category: str,
+    model: str,
+    position: list[float],
+    orientation: list[float] | None = None,
+) -> Any | None:
+    if not name or not category or not model or position is None:
+        return None
+    existing = scene.object_registry("name", name)
+    if existing is not None:
+        _remove_scene_object(scene, name)
+        _step_sim(2)
+    obj = DatasetObject(name=name, category=category, model=model, visual_only=True)
+    scene.add_object(obj)
+    _step_sim(5)
+    obj.set_position_orientation(
+        position=th.tensor([float(v) for v in position], dtype=th.float32),
+        orientation=th.tensor([float(v) for v in (orientation or [0.0, 0.0, 0.0, 1.0])], dtype=th.float32),
+    )
+    try:
+        obj.visual_only = True
+    except Exception:
+        pass
+    try:
+        obj.keep_still()
+    except Exception:
+        pass
+    return obj
+
+
+def _set_container_open(obj, value: bool = True) -> None:
+    try:
+        states = getattr(obj, "states", {})
+        if object_states.Open in states:
+            states[object_states.Open].set_value(bool(value))
+    except Exception:
+        pass
+
+
+def _container_pose(box_state: dict[str, Any]) -> tuple[list[float] | None, list[float]]:
+    placement = box_state.get("container_placement") or {}
+    position = placement.get("position")
+    orientation = (
+        placement.get("orientation")
+        or placement.get("quaternion_xyzw")
+        or box_state.get("container_orientation")
+        or [0.0, 0.0, 0.0, 1.0]
+    )
+    return position, orientation
+
+
+def _content_position(box_state: dict[str, Any], content: dict[str, Any] | None = None) -> list[float] | None:
+    bbox = box_state.get("container_bbox")
+    if isinstance(bbox, list) and len(bbox) == 2:
+        lo = np.array(bbox[0], dtype=float)
+        hi = np.array(bbox[1], dtype=float)
+        center = (lo + hi) * 0.5
+        content_height = 0.04
+        if isinstance(content, dict) and isinstance(content.get("bbox_size_m"), list) and len(content["bbox_size_m"]) >= 3:
+            content_height = max(float(content["bbox_size_m"][2]), content_height)
+        center[2] = float(lo[2] + min(0.08, max(content_height * 0.5, 0.02)))
+        return center.tolist()
+    container_position, _ = _container_pose(box_state)
+    if container_position:
+        return [float(container_position[0]), float(container_position[1]), float(container_position[2]) + 0.08]
+    return None
+
+
+def _content_name(phase_key: str, box_index: int, content: dict[str, Any]) -> str:
+    category = normalize_text(content.get("category")) or "object"
+    return f"render_unobserved_content_{phase_key}_{box_index}_{category}"
+
+
+def _setup_containers(scene, states: list[dict[str, Any]]) -> list[str]:
+    names = []
+    for state in states:
+        position, orientation = _container_pose(state)
+        obj = _add_dataset_object(
+            scene,
+            name=state.get("container_name") or f"render_unobserved_box_{state['box_index']}",
+            category=state.get("container_category"),
+            model=state.get("container_model"),
+            position=position,
+            orientation=orientation,
+        )
+        if obj is not None:
+            _set_container_open(obj, True)
+            names.append(obj.name)
+    _step_sim(10)
+    return names
+
+
+def _clear_phase_contents(scene, states: list[dict[str, Any]], phase_keys: tuple[str, ...] = ("phase1_content", "phase2_content")) -> None:
+    for state in states:
+        for phase_key in phase_keys:
+            content = state.get(phase_key)
+            if isinstance(content, dict):
+                _remove_scene_object(scene, _content_name(phase_key, int(state["box_index"]), content))
+    _step_sim(5)
+
+
+def _setup_phase_contents(scene, states: list[dict[str, Any]], phase_key: str) -> list[str]:
+    _clear_phase_contents(scene, states)
+    names = []
+    for state in states:
+        content = state.get(phase_key)
+        if not isinstance(content, dict):
+            continue
+        position = _content_position(state, content)
+        obj = _add_dataset_object(
+            scene,
+            name=_content_name(phase_key, int(state["box_index"]), content),
+            category=content.get("category"),
+            model=content.get("representative_model"),
+            position=position,
+        )
+        if obj is not None:
+            names.append(obj.name)
+    _step_sim(10)
+    return names
 
 
 def _question_data(payload: dict[str, Any]) -> dict[str, Any]:
@@ -196,12 +369,15 @@ def _reference_image_paths(payload: dict[str, Any], source_json: Path, config=No
         return [], None, "missing_phase_reference_images"
     path1 = resolve_path(image1.get("image_path"), source_json, data_root=data_root)
     path2 = resolve_path(image2.get("image_path"), source_json, data_root=data_root)
-    if path1 is None or path2 is None:
-        return [], None, "unresolved_phase_reference_images"
     pose = image2.get("camera_pose")
     if not pose or not pose.get("position") or not pose.get("quaternion_xyzw"):
         return [], None, "missing_phase2_camera_pose"
-    return [path1, path2], pose, None
+    paths = []
+    if path1 is not None:
+        paths.append(path1)
+    if path2 is not None:
+        paths.append(path2)
+    return paths, pose, None
 
 
 def preprocess(payload: dict[str, Any], source_json: Path, config=None) -> dict[str, Any]:
@@ -212,6 +388,7 @@ def preprocess(payload: dict[str, Any], source_json: Path, config=None) -> dict[
         "source_json": str(source_json),
         "reference_image_paths": [str(path) for path in reference_paths],
         "initial_camera_pose": pose,
+        "step_image_root": str(getattr(config, "step_image_root", "")) if config is not None else "",
     }
 
 
@@ -240,12 +417,46 @@ def postprocess_env(
     task_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     states = build_states_from_payload(payload)
+    scene = env.scene
+    container_names = _setup_containers(scene, states)
+
+    source_json = Path((task_state or {}).get("source_json") or "question.json")
+    qid = question_id(payload, source_json)
+    reference_dir = source_json.parent / ".active_references" / qid
+    if task_state is not None:
+        configured_root = task_state.get("step_image_root")
+        if configured_root:
+            scene_name, room_name = scene_room(payload)
+            reference_dir = Path(configured_root) / TASK_NAME / scene_name / room_name / qid / "references"
+
+    generated_reference_paths: list[str] = []
+    render = _question_data(payload).get("render") or {}
+    for phase_key, content_key, file_name in (
+        ("image1", "phase1_content", "phase1_reference.png"),
+        ("image2", "phase2_content", "phase2_reference.png"),
+    ):
+        image = _first_gt_image(payload, phase_key)
+        pose = (image or {}).get("camera_pose")
+        if pose and pose.get("position") and pose.get("quaternion_xyzw"):
+            _setup_phase_contents(scene, states, content_key)
+            output_path = reference_dir / file_name
+            _capture_view(output_path, pose, fov_deg=(image or {}).get("fov_deg"))
+            generated_reference_paths.append(str(output_path))
+
+    phase2_names = _setup_phase_contents(scene, states, "phase2_content")
+    _set_viewer_camera_fov(float(render.get("fov_deg") or 90.0))
     if task_state is not None:
         task_state["unobserved_change_states"] = states
         task_state["phase_descriptions"] = _phase_description_map(payload)
+        if generated_reference_paths:
+            task_state["reference_image_paths"] = generated_reference_paths
+        task_state["dynamic_object_names"] = container_names + phase2_names
     return {
         "box_count": len(states),
-        "reference_driven": True,
+        "reference_driven": bool(generated_reference_paths),
+        "generated_reference_images": generated_reference_paths,
+        "container_names": container_names,
+        "phase2_content_names": phase2_names,
     }
 
 

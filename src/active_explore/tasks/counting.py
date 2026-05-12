@@ -44,6 +44,22 @@ def normalize_answer(value: Any) -> str:
     return normalize_text(value).lower()
 
 
+def existing_model_for_category(category: str, preferred_model: str = "") -> str:
+    category = normalize_text(category)
+    preferred_model = normalize_text(preferred_model)
+    if not category:
+        return preferred_model
+    assets_root = Path("/home/yininghong/BEHAVIOR-1K/datasets/behavior-1k-assets/objects")
+    category_root = assets_root / category
+    if preferred_model and (category_root / preferred_model / "usd" / f"{preferred_model}.usdz.encrypted").exists():
+        return preferred_model
+    if category_root.exists():
+        for model_dir in sorted(category_root.iterdir()):
+            if model_dir.is_dir() and (model_dir / "usd" / f"{model_dir.name}.usdz.encrypted").exists():
+                return model_dir.name
+    return preferred_model
+
+
 def normalize_count_answer(value: Any, allow_not_sure: bool = True) -> str:
     if value is None:
         return ""
@@ -207,11 +223,24 @@ def build_env_objects(payload: dict[str, Any]) -> list[dict[str, Any]]:
     render = payload.get("question_data", {}).get("render", {})
     resolved = render.get("resolved_objects") or {}
     output = []
+    question_data = payload.get("question_data", {})
+    count_object = question_data.get("count_object") or {}
+    semantic_target_category = normalize_text(question_data.get("count_target") or count_object.get("category"))
     for group_name in ("containers", "confusers", "targets"):
         for item in resolved.get(group_name, []) or []:
             name = normalize_text(item.get("name"))
             category = normalize_text(item.get("category"))
             model = normalize_text(item.get("model"))
+            if (
+                group_name == "targets"
+                and semantic_target_category
+                and normalize_text(item.get("role")) == "count_target"
+            ):
+                name_category = normalize_text(item.get("category"))
+                if name_category and name_category in name:
+                    name = name.replace(name_category, semantic_target_category)
+                category = semantic_target_category
+                model = existing_model_for_category(category, model)
             position = item.get("position") or item.get("requested_position")
             if not name or not category or not model or position is None:
                 continue

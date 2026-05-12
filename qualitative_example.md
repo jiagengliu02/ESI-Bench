@@ -1,0 +1,9 @@
+# original qualitative
+deformable cover Beechwood_0_int kitchen_0 q_001 布从罐子上掀开动画；换视角动画
+mirror mirror_correspondence Beechwood_0_garden living_room_0 q_006 orbit动画应该就行
+
+# new qualitative
+counting hidden_by_others grocery_store_cafe diningroom_0 q_001 位置在renders_counting_diverse目录下，稍微转一下就能看到三个墨水瓶
+cognitivemap long-horizon-navigation Beechwood_0_garden full_scene q_011 这个例子没没问题了
+cognitivemap topological-connectivity restaurant_asian full_scene q_004 这个例子也没问题了
+unobserved_changes change_detection grocery_store_cafe dining_room_0 q_000 可以两个视频，都是走过去打开盒子，然后发现盒子里的东西不一样
