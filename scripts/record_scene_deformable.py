@@ -29,7 +29,7 @@ from scipy.spatial.transform import Rotation  # noqa: E402
 
 
 gm.ENABLE_FLATCACHE = False
-gm.USE_GPU_DYNAMICS = False
+gm.USE_GPU_DYNAMICS = True
 gm.ENABLE_OBJECT_STATES = True
 gm.ENABLE_TRANSITION_RULES = False
 
@@ -1338,10 +1338,10 @@ def main() -> int:
             orientation=th.tensor(first_quat, dtype=th.float32),
         )
         log("capturing first frame")
-        try:
-            og.sim.stop()
-        except Exception:
-            pass
+        # try:
+        #     og.sim.stop()
+        # except Exception:
+        #     pass
         first_rgb = capture_rgb()
         log(f"first frame captured shape={first_rgb.shape}")
         height, width = first_rgb.shape[:2]
