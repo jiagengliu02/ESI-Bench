@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=None, help="Optional output width.")
     parser.add_argument("--height", type=int, default=None, help="Optional output height.")
     parser.add_argument("--robot", default="R1")
-    parser.add_argument("--full-scene", default=True, action="store_true", help="Load full scene instead of a single room.")
+    parser.add_argument("--full-scene", action="store_true", help="Load full scene instead of a single room.")
     parser.add_argument("--room-only", action="store_true", help="Ignore a task module's FULL_SCENE default and load only --room / metadata room.")
     parser.add_argument("--hide-ceilings", action="store_true", help="Do not load ceilings.")
     parser.add_argument("--hide-walls", action="store_true", help="Do not load walls.")
