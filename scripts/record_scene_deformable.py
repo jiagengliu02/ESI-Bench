@@ -1324,9 +1324,9 @@ def main() -> int:
             orientation=th.tensor(first_quat, dtype=th.float32),
         )
         log("capturing first frame")
-        first_rgb = capture_rgb()
-        log(f"first frame captured shape={first_rgb.shape}")
-        height, width = first_rgb.shape[:2]
+        # first_rgb = capture_rgb()
+        # log(f"first frame captured shape={first_rgb.shape}")
+        # height, width = first_rgb.shape[:2]
         out_width = args.width or width
         out_height = args.height or height
         if args.interactive:
@@ -1353,11 +1353,11 @@ def main() -> int:
                     orientation=th.tensor(frame_quat, dtype=th.float32),
                 )
                 og.sim.step()
-                rgb = capture_rgb()
-                if (rgb.shape[1], rgb.shape[0]) != (out_width, out_height):
-                    rgb = cv2.resize(rgb, (out_width, out_height), interpolation=cv2.INTER_AREA)
-                rgb = annotate_frame(rgb, args, demo_state, frame, args.frames)
-                writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+                # rgb = capture_rgb()
+                # if (rgb.shape[1], rgb.shape[0]) != (out_width, out_height):
+                #     rgb = cv2.resize(rgb, (out_width, out_height), interpolation=cv2.INTER_AREA)
+                # rgb = annotate_frame(rgb, args, demo_state, frame, args.frames)
+                # writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
         finally:
             writer.release()
         print(json.dumps({"output": str(args.output.resolve()), "frames": args.frames, "fps": args.fps}, indent=2))
