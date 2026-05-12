@@ -1093,47 +1093,10 @@ def rgb_obs_to_uint8(frame: Any) -> np.ndarray:
     return image
 
 
-def capture_rgb_from_viewer() -> np.ndarray:
-    for _ in range(2):
+def capture_rgb(render_frames: int = 4) -> np.ndarray:
+    for _ in range(max(int(render_frames), 1)):
         og.sim.render()
     return rgb_obs_to_uint8(og.sim._viewer_camera.get_obs()[0]["rgb"])
-
-
-def load_rgb_from_path(path: Path) -> np.ndarray:
-    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if image is None:
-        raise RuntimeError(f"Could not read captured image from {path}")
-    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-
-def capture_rgb(
-    env,
-    task_module,
-    payload: dict[str, Any] | None,
-    task_state: dict[str, Any],
-    pos: np.ndarray,
-    quat: np.ndarray,
-    frame_tag: str,
-) -> np.ndarray:
-    if payload is not None and task_module is not None and hasattr(task_module, "capture_image"):
-        capture_root = Path(task_state.get("step_image_root") or (REPO_ROOT / "outputs" / "steps"))
-        image_path = capture_root / "record_scene_deformable" / f"{frame_tag}.png"
-        camera_info = {"camera_pose": {"position": np.array(pos, dtype=float).tolist(), "quaternion_xyzw": np.array(quat, dtype=float).tolist()}}
-        try:
-            captured_path = call_with_supported_args(
-                task_module.capture_image,
-                env,
-                payload,
-                camera_info,
-                np.array(pos, dtype=float),
-                np.array(quat, dtype=float),
-                image_path,
-                task_state=task_state,
-            )
-            return load_rgb_from_path(Path(captured_path))
-        except Exception as exc:
-            log(f"warning: task capture_image failed for {frame_tag}, falling back to viewer get_obs: {exc}")
-    return capture_rgb_from_viewer()
 
 
 def make_writer(path: Path, fps: float, width: int, height: int) -> cv2.VideoWriter:
@@ -1180,10 +1143,6 @@ def rotate_camera(quat: np.ndarray, yaw_deg: float = 0.0, pitch_deg: float = 0.0
 
 
 def record_interactive(
-    env,
-    task_module,
-    payload: dict[str, Any] | None,
-    task_state: dict[str, Any],
     args: argparse.Namespace,
     pos: np.ndarray,
     quat: np.ndarray,
@@ -1235,8 +1194,7 @@ def record_interactive(
                 position=th.tensor(pos, dtype=th.float32),
                 orientation=th.tensor(quat, dtype=th.float32),
             )
-            og.sim.step()
-            rgb = capture_rgb(env, task_module, payload, task_state, pos, quat, f"interactive_{frame_count:06d}")
+            rgb = capture_rgb()
             if (rgb.shape[1], rgb.shape[0]) != (out_width, out_height):
                 rgb = cv2.resize(rgb, (out_width, out_height), interpolation=cv2.INTER_AREA)
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
@@ -1365,14 +1323,18 @@ def main() -> int:
             orientation=th.tensor(first_quat, dtype=th.float32),
         )
         log("capturing first frame")
-        first_rgb = capture_rgb(env, task_module, payload, task_state, first_pos, first_quat, "first_frame")
+        try:
+            og.sim.stop()
+        except Exception:
+            pass
+        first_rgb = capture_rgb()
         log(f"first frame captured shape={first_rgb.shape}")
         height, width = first_rgb.shape[:2]
         out_width = args.width or width
         out_height = args.height or height
         if args.interactive:
             log("entering interactive recorder")
-            return record_interactive(env, task_module, payload, task_state, args, first_pos, first_quat, out_width, out_height)
+            return record_interactive(args, first_pos, first_quat, out_width, out_height)
         writer = make_writer(args.output, args.fps, out_width, out_height)
         try:
             for frame in range(args.frames):
@@ -1393,8 +1355,7 @@ def main() -> int:
                     position=th.tensor(frame_pos, dtype=th.float32),
                     orientation=th.tensor(frame_quat, dtype=th.float32),
                 )
-                og.sim.step()
-                rgb = capture_rgb(env, task_module, payload, task_state, frame_pos, frame_quat, f"frame_{frame:06d}")
+                rgb = capture_rgb()
                 if (rgb.shape[1], rgb.shape[0]) != (out_width, out_height):
                     rgb = cv2.resize(rgb, (out_width, out_height), interpolation=cv2.INTER_AREA)
                 rgb = annotate_frame(rgb, args, demo_state, frame, args.frames)
