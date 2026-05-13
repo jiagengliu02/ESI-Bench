@@ -1021,9 +1021,9 @@ def deformable_unveil_frame(
             angle=math.radians(-90.0),
             look_height=0.35,
         )
-    if frame >= approach_frames and state.get("cloth_name") and not bool(state.get("cloth_removed")):
-        removed = remove_object_by_name(env.scene, state.get("cloth_name"))
-        state["cloth_removed"] = bool(removed)
+    # if frame >= approach_frames and state.get("cloth_name") and not bool(state.get("cloth_removed")):
+    #     removed = remove_object_by_name(env.scene, state.get("cloth_name"))
+    #     state["cloth_removed"] = bool(removed)
     end_pos, _ = approach_target_pose(
         pos,
         quat,
