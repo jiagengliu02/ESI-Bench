@@ -1394,21 +1394,33 @@ def main() -> int:
         log(f"settled {max(args.settle_steps, 0)} steps")
 
         pos, quat = initial_camera(payload, task_module, args)
-        capture_width = args.width or 1280
-        capture_height = args.height or 720
-        capture_camera = create_video_capture_camera(width=capture_width, height=capture_height)
-        set_camera_fov(capture_camera, preferred_camera_fov(payload, args))
-        set_capture_camera_pose(capture_camera, pos, quat)
+        camera_info = {"camera_pose": {"position": pos.tolist(), "quaternion_xyzw": quat.tolist()}}
+        if payload is not None and task_module is not None and not args.no_task_setup and hasattr(task_module, "postprocess_env"):
+            log(f"running task setup for task={args.task}")
+            task_state = {
+                "source_json": str(question_json) if question_json is not None else "",
+                "step_image_root": str((REPO_ROOT / "outputs" / "steps").resolve()),
+            }
+            setup_result = call_with_supported_args(task_module.postprocess_env, env, payload, camera_info, task_state=task_state)
+            if isinstance(setup_result, dict):
+                task_state.update(setup_result)
+            doorlike_summary = remove_scene_doorlike_objects(env)
+            if doorlike_summary["target_total"]:
+                log(
+                    "removed task doorlike objects="
+                    f"{len(doorlike_summary['removed'])}/{doorlike_summary['target_total']} "
+                    f"failed={len(doorlike_summary['failed'])}"
+                )
+            pos, quat = initial_camera(payload, task_module, args)
+            log("task setup complete")
 
-        if args.interactive:
-            first_rgb = capture_rgb(capture_camera)
-            height, width = first_rgb.shape[:2]
-            out_width = args.width or width
-            out_height = args.height or height
-            log("entering interactive recorder")
-            return record_interactive(args, capture_camera, pos, quat, out_width, out_height)
-
-        log("initial camera set. Simulator will keep running until Ctrl+C.")
+        target, target_source = target_from_payload(payload, args)
+        demo_state = prepare_task_demo(env, task_module, payload, task_state, args)
+        if args.motion in {"target-orbit", "counting-scan"}:
+            if target is None:
+                log(f"{args.motion} could not infer a target; falling back to camera-relative orbit")
+            else:
+                log(f"{args.motion} target_source={target_source} target={target.round(4).tolist()}")
         try:
             while True:
                 try:
@@ -1422,6 +1434,60 @@ def main() -> int:
         except KeyboardInterrupt:
             log("exit requested by user (Ctrl+C)")
         return 0
+        # first_pos, first_quat = frame_pose_and_actions(
+        #     env,
+        #     task_module,
+        #     payload,
+        #     task_state,
+        #     demo_state,
+        #     pos,
+        #     quat,
+        #     0,
+        #     args.frames,
+        #     args,
+        #     target,
+        # )
+        # capture_width = args.width or 1280
+        # capture_height = args.height or 720
+        # capture_camera = create_video_capture_camera(width=capture_width, height=capture_height)
+        # set_camera_fov(capture_camera, preferred_camera_fov(payload, args))
+        # log("setting initial video capture camera")
+        # set_capture_camera_pose(capture_camera, first_pos, first_quat)
+        # log("capturing first frame")
+        # first_rgb = capture_rgb(capture_camera)
+        # log(f"first frame captured shape={first_rgb.shape}")
+        # height, width = first_rgb.shape[:2]
+        # out_width = args.width or width
+        # out_height = args.height or height
+        # if args.interactive:
+        #     log("entering interactive recorder")
+        #     return record_interactive(args, capture_camera, first_pos, first_quat, out_width, out_height)
+        # writer = make_writer(args.output, args.fps, out_width, out_height)
+        # try:
+        #     for frame in range(args.frames):
+        #         frame_pos, frame_quat = frame_pose_and_actions(
+        #             env,
+        #             task_module,
+        #             payload,
+        #             task_state,
+        #             demo_state,
+        #             pos,
+        #             quat,
+        #             frame,
+        #             args.frames,
+        #             args,
+        #             target,
+        #         )
+        #         set_capture_camera_pose(capture_camera, frame_pos, frame_quat)
+        #         rgb = capture_rgb(capture_camera)
+        #         if (rgb.shape[1], rgb.shape[0]) != (out_width, out_height):
+        #             rgb = cv2.resize(rgb, (out_width, out_height), interpolation=cv2.INTER_AREA)
+        #         rgb = annotate_frame(rgb, args, demo_state, frame, args.frames)
+        #         writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        # finally:
+        #     writer.release()
+        # print(json.dumps({"output": str(args.output.resolve()), "frames": args.frames, "fps": args.fps}, indent=2))
+        # return 0
     finally:
         if env is not None:
             try:
