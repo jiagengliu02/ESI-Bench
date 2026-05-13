@@ -24,6 +24,7 @@ ACTIVE_EXPLORE_DIR = REPO_ROOT / "src" / "active_explore"
 sys.path.insert(0, str(ACTIVE_EXPLORE_DIR))
 
 import omnigibson as og  # noqa: E402
+import omnigibson.utils.transform_utils as T  # noqa: E402
 from omnigibson.macros import gm  # noqa: E402
 from omnigibson.sensors.vision_sensor import VisionSensor  # noqa: E402
 from scipy.spatial.transform import Rotation  # noqa: E402
@@ -40,6 +41,9 @@ TURN_DEG = 0.6
 DOORLIKE_KEYWORDS = ("door", "doorway")
 DOORLIKE_EXCLUDED_CATEGORIES = ("door", "sliding_door", "doorway")
 COGNITIVEMAP_CAMERA_PITCH_DEG = -10.0
+VIEWER_FRAME_RENDER_STEPS = 12
+VIEWER_FRAME_MAX_RETRIES = 3
+VIEWER_FRAME_RETRY_SLEEP_SEC = 0.15
 
 
 def parse_args() -> argparse.Namespace:
@@ -266,15 +270,6 @@ def open_scene_doors(env) -> int:
     return opened
 
 
-def set_viewer_camera_fov(fov_deg: float | None) -> None:
-    if fov_deg is None:
-        return
-    cam = getattr(og.sim, "viewer_camera", None) or getattr(og.sim, "_viewer_camera", None)
-    if cam is None:
-        return
-    set_camera_fov(cam, fov_deg)
-
-
 def set_camera_fov(cam, fov_deg: float | None) -> None:
     if cam is None or fov_deg is None:
         return
@@ -317,19 +312,23 @@ def initial_camera(payload: dict[str, Any] | None, task_module, args: argparse.N
 
 
 def look_at_quat(eye: np.ndarray, target: np.ndarray) -> np.ndarray:
-    forward = target - eye
-    norm = np.linalg.norm(forward)
-    if norm < 1e-9:
-        return np.array([0.0, 0.0, 0.0, 1.0], dtype=float)
-    forward = forward / norm
-    world_up = np.array([0.0, 0.0, 1.0], dtype=float)
-    right = np.cross(forward, world_up)
-    if np.linalg.norm(right) < 1e-9:
-        right = np.array([1.0, 0.0, 0.0], dtype=float)
-    right = right / np.linalg.norm(right)
-    up = np.cross(right, forward)
-    rot = np.array([right, up, -forward]).T
-    return Rotation.from_matrix(rot).as_quat()
+    eye_t = th.tensor([float(v) for v in eye], dtype=th.float32)
+    target_t = th.tensor([float(v) for v in target], dtype=th.float32)
+    backward = eye_t - target_t
+    backward = backward / th.norm(backward)
+
+    world_up = th.tensor([0.0, 0.0, 1.0], dtype=th.float32)
+    right = th.linalg.cross(world_up, backward)
+    if float(th.norm(right)) < 1e-6:
+        world_up = th.tensor([1.0, 0.0, 0.0], dtype=th.float32)
+        right = th.linalg.cross(world_up, backward)
+
+    right = right / th.norm(right)
+    up = th.linalg.cross(backward, right)
+    up = up / th.norm(up)
+    rot = th.stack([right, up, backward], dim=1)
+    quat = T.mat2quat(rot).to(dtype=th.float32)
+    return np.array(quat.detach().cpu().tolist(), dtype=float)
 
 
 def ease_in_out(value: float) -> float:
@@ -1140,18 +1139,40 @@ def rgb_obs_to_uint8(frame: Any) -> np.ndarray:
     return image
 
 
+def render_only(frames: int = 5) -> None:
+    for _ in range(max(int(frames), 0)):
+        try:
+            og.sim.render()
+        except Exception:
+            break
+
+
+def warmup_render_pipeline(steps: int = 4, renders: int = 4) -> None:
+    for _ in range(max(int(steps), 0)):
+        try:
+            og.sim.step()
+        except Exception:
+            break
+    render_only(renders)
+
+
 def create_video_capture_camera(width: int = 1280, height: int = 720) -> VisionSensor:
-    camera = VisionSensor(
-        relative_prim_path="/video_capture_camera",
-        name="video_capture_camera",
-        modalities=["rgb"],
-        image_height=int(height),
-        image_width=int(width),
-        clipping_range=(0.001, 1000.0),
-        viewport_name=None,
-    )
-    camera.load(None)
-    camera.initialize()
+    camera = getattr(og.sim, "_viewer_camera", None) or getattr(og.sim, "viewer_camera", None)
+    if camera is None:
+        raise RuntimeError("Viewer camera is unavailable; cannot capture RGB frames.")
+    try:
+        if not camera.initialized:
+            camera.initialize()
+    except Exception:
+        pass
+    try:
+        camera.image_height = int(height)
+    except Exception:
+        pass
+    try:
+        camera.image_width = int(width)
+    except Exception:
+        pass
     try:
         camera.initialize_sensors(names=["rgb"])
     except Exception:
@@ -1160,19 +1181,41 @@ def create_video_capture_camera(width: int = 1280, height: int = 720) -> VisionS
         camera.clipping_range = th.tensor([0.001, 1000.0], dtype=th.float32)
     except Exception:
         pass
-    for _ in range(4):
-        try:
-            og.sim.render()
-        except Exception:
-            break
+    warmup_render_pipeline(steps=2, renders=4)
     return camera
 
 
-def capture_rgb(camera, render_frames: int = 4) -> np.ndarray:
-    for _ in range(max(int(render_frames), 1)):
-        og.sim.render()
-    obs, _info = camera.get_obs()
-    return rgb_obs_to_uint8(obs["rgb"])
+def set_capture_camera_pose(camera: VisionSensor, pos: np.ndarray, quat: np.ndarray) -> None:
+    if getattr(camera, "_prim", None) is None:
+        raise RuntimeError("Capture camera prim was not loaded into the stage before configuration.")
+    camera.set_position_orientation(
+        position=th.tensor([float(v) for v in pos], dtype=th.float32),
+        orientation=th.tensor([float(v) for v in quat], dtype=th.float32),
+    )
+    try:
+        camera.clipping_range = th.tensor([0.01, 100.0], dtype=th.float32)
+    except Exception:
+        pass
+    warmup_render_pipeline(steps=4, renders=4)
+
+
+def capture_rgb(camera: VisionSensor, render_frames: int = VIEWER_FRAME_RENDER_STEPS) -> np.ndarray:
+    last_exc: Exception | None = None
+    for attempt in range(1, VIEWER_FRAME_MAX_RETRIES + 1):
+        try:
+            warmup_render_pipeline(steps=2, renders=render_frames)
+            obs, info = camera.get_obs()
+            if not isinstance(obs, dict):
+                raise RuntimeError(f"get_obs() returned non-dict obs: {type(obs)}")
+            if "rgb" not in obs:
+                raise RuntimeError(f"RGB not found in obs. keys={list(obs.keys())}, info={info}")
+            return rgb_obs_to_uint8(obs["rgb"])
+        except Exception as exc:
+            last_exc = exc
+            if attempt < VIEWER_FRAME_MAX_RETRIES:
+                time.sleep(VIEWER_FRAME_RETRY_SLEEP_SEC)
+    assert last_exc is not None
+    raise last_exc
 
 
 def make_writer(path: Path, fps: float, width: int, height: int) -> cv2.VideoWriter:
@@ -1220,6 +1263,7 @@ def rotate_camera(quat: np.ndarray, yaw_deg: float = 0.0, pitch_deg: float = 0.0
 
 def record_interactive(
     args: argparse.Namespace,
+    capture_camera: VisionSensor,
     pos: np.ndarray,
     quat: np.ndarray,
     out_width: int,
@@ -1266,11 +1310,8 @@ def record_interactive(
                 mouse["yaw"] = 0.0
                 mouse["pitch"] = 0.0
 
-            og.sim._viewer_camera.set_position_orientation(
-                position=th.tensor(pos, dtype=th.float32),
-                orientation=th.tensor(quat, dtype=th.float32),
-            )
-            rgb = capture_rgb(og.sim._viewer_camera)
+            set_capture_camera_pose(capture_camera, pos, quat)
+            rgb = capture_rgb(capture_camera)
             if (rgb.shape[1], rgb.shape[0]) != (out_width, out_height):
                 rgb = cv2.resize(rgb, (out_width, out_height), interpolation=cv2.INTER_AREA)
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
@@ -1334,7 +1375,7 @@ def main() -> int:
     config = build_env_config(scene, room, args.robot, objects, full_scene=full_scene, args=args)
 
     env = None
-    video_capture_camera = None
+    capture_camera = None
     try:
         log(f"loading scene={scene} room={room} full_scene={full_scene}")
         env = og.Environment(configs=config)
@@ -1373,7 +1414,6 @@ def main() -> int:
             pos, quat = initial_camera(payload, task_module, args)
             log("task setup complete")
 
-        # set_viewer_camera_fov(args.fov_deg)
         target, target_source = target_from_payload(payload, args)
         demo_state = prepare_task_demo(env, task_module, payload, task_state, args)
         if args.motion in {"target-orbit", "counting-scan"}:
@@ -1396,22 +1436,19 @@ def main() -> int:
         )
         capture_width = args.width or 1280
         capture_height = args.height or 720
-        video_capture_camera = create_video_capture_camera(width=capture_width, height=capture_height)
-        set_camera_fov(video_capture_camera, preferred_camera_fov(payload, args))
+        capture_camera = create_video_capture_camera(width=capture_width, height=capture_height)
+        set_camera_fov(capture_camera, preferred_camera_fov(payload, args))
         log("setting initial video capture camera")
-        video_capture_camera.set_position_orientation(
-            position=th.tensor(first_pos, dtype=th.float32),
-            orientation=th.tensor(first_quat, dtype=th.float32),
-        )
+        set_capture_camera_pose(capture_camera, first_pos, first_quat)
         log("capturing first frame")
-        first_rgb = capture_rgb(video_capture_camera)
+        first_rgb = capture_rgb(capture_camera)
         log(f"first frame captured shape={first_rgb.shape}")
         height, width = first_rgb.shape[:2]
         out_width = args.width or width
         out_height = args.height or height
         if args.interactive:
             log("entering interactive recorder")
-            return record_interactive(args, first_pos, first_quat, out_width, out_height)
+            return record_interactive(args, capture_camera, first_pos, first_quat, out_width, out_height)
         writer = make_writer(args.output, args.fps, out_width, out_height)
         try:
             for frame in range(args.frames):
@@ -1428,11 +1465,8 @@ def main() -> int:
                     args,
                     target,
                 )
-                video_capture_camera.set_position_orientation(
-                    position=th.tensor(frame_pos, dtype=th.float32),
-                    orientation=th.tensor(frame_quat, dtype=th.float32),
-                )
-                rgb = capture_rgb(video_capture_camera)
+                set_capture_camera_pose(capture_camera, frame_pos, frame_quat)
+                rgb = capture_rgb(capture_camera)
                 if (rgb.shape[1], rgb.shape[0]) != (out_width, out_height):
                     rgb = cv2.resize(rgb, (out_width, out_height), interpolation=cv2.INTER_AREA)
                 rgb = annotate_frame(rgb, args, demo_state, frame, args.frames)
@@ -1442,11 +1476,6 @@ def main() -> int:
         print(json.dumps({"output": str(args.output.resolve()), "frames": args.frames, "fps": args.fps}, indent=2))
         return 0
     finally:
-        if video_capture_camera is not None:
-            try:
-                video_capture_camera.remove()
-            except Exception:
-                pass
         if env is not None:
             try:
                 og.shutdown()
