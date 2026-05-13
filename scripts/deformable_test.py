@@ -22,7 +22,6 @@ try:
     import torch as th  # noqa: E402
     from omnigibson.objects.dataset_object import DatasetObject  # noqa: E402
     from omnigibson.utils.constants import PrimType  # noqa: E402
-
     import batch_deformable as batch  # noqa: E402
     import batch_mirror_distance as scene_utils  # noqa: E402
 except ModuleNotFoundError as exc:  # pragma: no cover - depends on local OG env
@@ -32,6 +31,12 @@ except ModuleNotFoundError as exc:  # pragma: no cover - depends on local OG env
             "Please run this script inside the same OmniGibson-enabled environment used by the other scene scripts."
         ) from exc
     raise
+
+
+DEFAULT_SMALL_ITEM_CATEGORY = "can_of_tomato_paste"
+DEFAULT_SMALL_ITEM_MODEL = "sqqdzb"
+DEFAULT_CLOTH_CATEGORY = "dishtowel"
+DEFAULT_CLOTH_MODEL = "ltydgg"
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,12 +49,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--robot", default="R1")
     parser.add_argument("--run-idx", type=int, default=0)
     parser.add_argument("--seed", type=int, default=None, help="Override seed. Defaults to the batch stable seed.")
-    parser.add_argument("--small-item-json", type=str, default=batch.DEFAULT_SMALL_ITEM_JSON)
-    parser.add_argument("--cloth-json", type=str, default=batch.DEFAULT_CLOTH_JSON)
-    parser.add_argument("--small-item-category", type=str, default=None)
-    parser.add_argument("--small-item-model", type=str, default=None)
-    parser.add_argument("--cloth-category", type=str, default=None)
-    parser.add_argument("--cloth-model", type=str, default=None)
+    parser.add_argument("--small-item-category", type=str, default=DEFAULT_SMALL_ITEM_CATEGORY)
+    parser.add_argument("--small-item-model", type=str, default=DEFAULT_SMALL_ITEM_MODEL)
+    parser.add_argument("--cloth-category", type=str, default=DEFAULT_CLOTH_CATEGORY)
+    parser.add_argument("--cloth-model", type=str, default=DEFAULT_CLOTH_MODEL)
     parser.add_argument("--disable-trav-map-check", action="store_true")
     parser.add_argument("--fast-mode", dest="fast_mode", action="store_true", default=True)
     parser.add_argument("--normal-mode", dest="fast_mode", action="store_false")
@@ -246,10 +249,25 @@ def main() -> None:
     seed = int(args.seed) if args.seed is not None else int(batch._stable_seed(args.scene, args.room, args.run_idx))
     rng = random.Random(seed)
 
-    item_catalog = batch._load_small_item_catalog(args.small_item_json)
-    cloth_catalog = batch._load_cloth_catalog(args.cloth_json)
-    item_spec = _pick_small_item(rng, item_catalog, args.small_item_category, args.small_item_model)
-    cloth_spec = _pick_cloth(rng, cloth_catalog, args.cloth_category, args.cloth_model)
+    item_spec = _pick_small_item(
+        rng,
+        {str(args.small_item_category): [str(args.small_item_model)]},
+        args.small_item_category,
+        args.small_item_model,
+    )
+    cloth_spec = _pick_cloth(
+        rng,
+        [
+            {
+                "category": str(args.cloth_category),
+                "model": str(args.cloth_model),
+                "mass_kg": float(batch.DEFAULT_CLOTH_MASS_KG),
+                "group": "manual_default",
+            }
+        ],
+        args.cloth_category,
+        args.cloth_model,
+    )
 
     env = None
     item_obj = None
