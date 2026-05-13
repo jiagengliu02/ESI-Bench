@@ -462,17 +462,75 @@ def _load_room_context(scene, scene_name: str, room_name: str, floor_name: str |
     return floor_record, room_bbox_world_xy, resolved_room_instance, room_objects, blockers, trav_map, trav_map_img, preferred_center_xy
 
 
-def _spawn_item(scene, floor_record, item_xy, item_spec: dict[str, str], seed: int, args: argparse.Namespace):
+def _center_xy_from_bbox(bbox_min, bbox_max) -> tuple[float, float]:
+    return (
+        float(bbox_min[0] + bbox_max[0]) * 0.5,
+        float(bbox_min[1] + bbox_max[1]) * 0.5,
+    )
+
+
+def _point_inside_bbox_xy(point_xy, bbox_min, bbox_max, margin: float = 0.0) -> bool:
+    return (
+        float(bbox_min[0]) + float(margin) <= float(point_xy[0]) <= float(bbox_max[0]) - float(margin)
+        and float(bbox_min[1]) + float(margin) <= float(point_xy[1]) <= float(bbox_max[1]) - float(margin)
+    )
+
+
+def _is_support_surface_candidate(record, floor_record) -> bool:
+    category = str(record.category).lower()
+    name = str(record.name).lower()
+    label = f"{category} {name}"
+    if not any(token in label for token in ("table", "desk", "counter", "island", "stand")):
+        return False
+    if float(record.bbox_max[2]) <= float(floor_record.bbox_max[2]) + 0.30:
+        return False
+    if float(record.extents[0]) < 0.20 or float(record.extents[1]) < 0.20:
+        return False
+    support_center_xy = _center_xy_from_bbox(record.bbox_min, record.bbox_max)
+    return _point_inside_bbox_xy(support_center_xy, floor_record.bbox_min, floor_record.bbox_max, margin=0.0)
+
+
+def _choose_support_surface(room_objects, floor_record):
+    candidates = [record for record in room_objects if _is_support_surface_candidate(record, floor_record)]
+    if candidates:
+        candidates.sort(
+            key=lambda record: (
+                -(float(record.extents[0]) * float(record.extents[1])),
+                -float(record.bbox_max[2]),
+                record.name,
+            )
+        )
+        support = candidates[0]
+        return support, {
+            "support_type": "table_like_surface",
+            "support_name": str(support.name),
+            "support_category": str(support.category),
+            "support_bbox_min": [float(v) for v in support.bbox_min],
+            "support_bbox_max": [float(v) for v in support.bbox_max],
+            "candidate_surface_names": [str(record.name) for record in candidates],
+        }
+    return floor_record, {
+        "support_type": "floor_fallback",
+        "support_name": str(floor_record.name),
+        "support_category": str(floor_record.category),
+        "support_bbox_min": [float(v) for v in floor_record.bbox_min],
+        "support_bbox_max": [float(v) for v in floor_record.bbox_max],
+        "candidate_surface_names": [],
+    }
+
+
+def _spawn_item(scene, support_record, item_spec: dict[str, str], seed: int, args: argparse.Namespace):
     item_name = f"{batch.RENDER_OBJECT_PREFIX}item_{seed:010d}"
     item_obj = DatasetObject(name=item_name, category=item_spec["category"], model=item_spec["model"])
     scene.add_object(item_obj)
     scene_utils._step_sim(args.item_add_steps)
+    support_center_xy = _center_xy_from_bbox(support_record.bbox_min, support_record.bbox_max)
     item_obj.set_position_orientation(
         position=th.tensor(
             [
-                float(item_xy[0]),
-                float(item_xy[1]),
-                float(floor_record.bbox_max[2]) + batch.DEFAULT_ITEM_DROP_HEIGHT_M,
+                float(support_center_xy[0]),
+                float(support_center_xy[1]),
+                float(support_record.bbox_max[2]) + batch.DEFAULT_ITEM_DROP_HEIGHT_M,
             ],
             dtype=th.float32,
         ),
@@ -481,7 +539,7 @@ def _spawn_item(scene, floor_record, item_xy, item_spec: dict[str, str], seed: i
     scene_utils._step_sim(args.item_settle_steps)
     batch._set_velocity_zero(item_obj)
     scene_utils._step_sim(args.post_item_freeze_steps)
-    return item_name, item_obj
+    return item_name, item_obj, {"placement_xy": [float(support_center_xy[0]), float(support_center_xy[1])]}
 
 
 def _spawn_cloth(scene, item_obj, cloth_spec: dict, seed: int, args: argparse.Namespace):
@@ -611,17 +669,8 @@ def main() -> None:
             preferred_center_xy,
         ) = _load_room_context(scene, args.scene, args.room, args.floor, args.disable_trav_map_check)
 
-        item_xy = batch._sample_free_position(
-            rng=rng,
-            floor_record=floor_record,
-            blockers=blockers,
-            preferred_center_xy=preferred_center_xy,
-            room_bbox_world_xy=room_bbox_world_xy,
-            trav_map=trav_map,
-            trav_map_img=trav_map_img,
-            clearance_m=batch.DEFAULT_ITEM_FREE_RADIUS_M,
-        )
-        _, item_obj = _spawn_item(scene, floor_record, item_xy, item_spec, seed, args)
+        support_record, support_meta = _choose_support_surface(room_objects, floor_record)
+        _, item_obj, item_placement = _spawn_item(scene, support_record, item_spec, seed, args)
         _, cloth_obj, cloth_configuration_used, cloth_drop_pos = _spawn_cloth(scene, item_obj, cloth_spec, seed, args)
         batch._set_velocity_zero(item_obj)
         batch._set_velocity_zero(cloth_obj)
@@ -646,7 +695,7 @@ def main() -> None:
             "seed": seed,
             "small_item": {
                 **item_spec,
-                "placement_xy": [round(float(item_xy[0]), 4), round(float(item_xy[1]), 4)],
+                "placement_xy": [round(float(v), 4) for v in item_placement["placement_xy"]],
             },
             "cloth": {
                 "category": cloth_spec["category"],
@@ -674,6 +723,7 @@ def main() -> None:
             },
             "room_object_count": len(room_objects),
             "blocker_count": len(blockers),
+            "support": support_meta,
             "robot": {
                 "name": str(getattr(robot, "name", args.robot)),
                 "type": str(getattr(robot, "category", args.robot)),
