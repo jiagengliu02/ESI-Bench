@@ -38,13 +38,13 @@ python scripts/record_scene_video.py \
 
 ## Counting / milk cartons
 
-`json-tmp/counting` does not contain bottle-counting examples. This command uses a milk-carton counting example instead. The script also corrects the JSON's target proxy from `club_sandwich` back to the semantic target category `milk_carton` when loading count targets.
+`json-tmp/counting` does not contain bottle-counting examples. This command uses a milk-carton counting example instead. The script also corrects the JSON's target proxy from `club_sandwich` back to the semantic target category `boxed_ink_cartridge` when loading count targets.
 
 ```bash
 python scripts/record_scene_video.py \
   --task counting \
-  --metadata "json-tmp/counting/observation_divided/grocery_store_cafe/dining_room_0/q_003.json" \
-  --output outputs/qualitative_task_demo/videos/counting_milk_carton_grocery_store_cafe_dining_room_0_q003.mp4 \
+  --metadata "json-tmp/counting/hidden_by_others/grocery_store_cafe/dining_room_0/q_001.json" \
+  --output outputs/qualitative_task_demo/videos/counting_boxed_ink_cartridge_grocery_store_cafe_dining_room_0_q001.mp4 \
   --motion task-demo \
   --frames 300 \
   --fps 30

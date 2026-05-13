@@ -18,6 +18,26 @@ from utils import normalize_text, resolve_path
 TASK_NAME = "unobserved_changes"
 FULL_SCENE = True
 DEFAULT_MODEL = "gemini-2.5-flash"
+ASSETS_ROOT = Path("/home/yininghong/BEHAVIOR-1K/datasets/behavior-1k-assets/objects")
+
+QUALITATIVE_CONTENT_OVERRIDES = {
+    # The original bottle_of_sage / lace meshes for this qualitative render can poke
+    # through the carton bottom. Use compact, stable contents for the two phases.
+    ("change_detection/q_000", "grocery_store_cafe", "dining_room_0", 0, "phase1_content"): {
+        "category": "can_of_icetea",
+        "display_name": "can of iced tea",
+        "representative_model": "ifrjsc",
+        "bbox_size_m": [0.07569613647460938, 0.07569613647460938, 0.14924559783935548],
+        "sampling_source": "qualitative_render_override",
+    },
+    ("change_detection/q_000", "grocery_store_cafe", "dining_room_0", 0, "phase2_content"): {
+        "category": "candle_holder",
+        "display_name": "candle holder",
+        "representative_model": "szulaa",
+        "bbox_size_m": [0.13289098691940307, 0.1329570770263672, 0.1368186492919922],
+        "sampling_source": "qualitative_render_override",
+    },
+}
 
 VALID_ACTIONS = {
     "move_forward",
@@ -95,6 +115,34 @@ def build_env_objects(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
+def _model_exists(category: str, model: str) -> bool:
+    category = normalize_text(category)
+    model = normalize_text(model)
+    if not category or not model:
+        return False
+    return (ASSETS_ROOT / category / model / "usd" / f"{model}.usdz.encrypted").exists()
+
+
+def _content_override_for_payload(
+    payload: dict[str, Any],
+    box_index: int,
+    phase_key: str,
+) -> dict[str, Any] | None:
+    key = (
+        normalize_text(payload.get("question_id")),
+        normalize_text(payload.get("scene")),
+        normalize_text(payload.get("room")),
+        int(box_index),
+        phase_key,
+    )
+    override = QUALITATIVE_CONTENT_OVERRIDES.get(key)
+    if override is None:
+        return None
+    if not _model_exists(override["category"], override["representative_model"]):
+        return None
+    return dict(override)
+
+
 def _step_sim(steps: int) -> None:
     for _ in range(max(int(steps), 0)):
         og.sim.step()
@@ -145,6 +193,8 @@ def _add_dataset_object(
     model: str,
     position: list[float],
     orientation: list[float] | None = None,
+    visual_only: bool = True,
+    keep_still_after_place: bool = True,
 ) -> Any | None:
     if not name or not category or not model or position is None:
         return None
@@ -152,7 +202,10 @@ def _add_dataset_object(
     if existing is not None:
         _remove_scene_object(scene, name)
         _step_sim(2)
-    obj = DatasetObject(name=name, category=category, model=model, visual_only=True)
+    object_kwargs = {"visual_only": bool(visual_only)}
+    if not visual_only:
+        object_kwargs.update({"fixed_base": False, "kinematic_only": False})
+    obj = DatasetObject(name=name, category=category, model=model, **object_kwargs)
     scene.add_object(obj)
     _step_sim(5)
     obj.set_position_orientation(
@@ -160,13 +213,14 @@ def _add_dataset_object(
         orientation=th.tensor([float(v) for v in (orientation or [0.0, 0.0, 0.0, 1.0])], dtype=th.float32),
     )
     try:
-        obj.visual_only = True
+        obj.visual_only = bool(visual_only)
     except Exception:
         pass
-    try:
-        obj.keep_still()
-    except Exception:
-        pass
+    if keep_still_after_place:
+        try:
+            obj.keep_still()
+        except Exception:
+            pass
     return obj
 
 
@@ -200,7 +254,8 @@ def _content_position(box_state: dict[str, Any], content: dict[str, Any] | None 
         content_height = 0.04
         if isinstance(content, dict) and isinstance(content.get("bbox_size_m"), list) and len(content["bbox_size_m"]) >= 3:
             content_height = max(float(content["bbox_size_m"][2]), content_height)
-        center[2] = float(lo[2] + min(0.08, max(content_height * 0.5, 0.02)))
+        container_height = max(float(hi[2] - lo[2]), 0.01)
+        center[2] = float(lo[2] + min(container_height * 0.72, max(content_height * 0.5 + 0.04, 0.075)))
         return center.tolist()
     container_position, _ = _container_pose(box_state)
     if container_position:
@@ -215,6 +270,7 @@ def _content_name(phase_key: str, box_index: int, content: dict[str, Any]) -> st
 
 def _setup_containers(scene, states: list[dict[str, Any]]) -> list[str]:
     names = []
+    objects: list[tuple[dict[str, Any], Any]] = []
     for state in states:
         position, orientation = _container_pose(state)
         obj = _add_dataset_object(
@@ -224,10 +280,29 @@ def _setup_containers(scene, states: list[dict[str, Any]]) -> list[str]:
             model=state.get("container_model"),
             position=position,
             orientation=orientation,
+            visual_only=False,
+            keep_still_after_place=False,
         )
         if obj is not None:
-            _set_container_open(obj, True)
             names.append(obj.name)
+            objects.append((state, obj))
+    _step_sim(90)
+    for state, obj in objects:
+        try:
+            lo, hi = obj.aabb
+            state["container_bbox"] = [np.array(lo, dtype=float).tolist(), np.array(hi, dtype=float).tolist()]
+        except Exception:
+            pass
+        _set_container_open(obj, True)
+        _step_sim(5)
+        try:
+            obj.keep_still()
+        except Exception:
+            pass
+        try:
+            obj.visual_only = True
+        except Exception:
+            pass
     _step_sim(10)
     return names
 
@@ -255,6 +330,7 @@ def _setup_phase_contents(scene, states: list[dict[str, Any]], phase_key: str) -
             category=content.get("category"),
             model=content.get("representative_model"),
             position=position,
+            visual_only=True,
         )
         if obj is not None:
             names.append(obj.name)
@@ -321,13 +397,20 @@ def build_states_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
     for box in _question_data(payload).get("boxes") or []:
         container = box.get("container") or {}
         phase_content = _phase_content_map(box)
+        box_index = int(box.get("box_index", len(states)))
+        phase1_content = _content_override_for_payload(payload, box_index, "phase1_content") or _content_payload_to_runtime(
+            phase_content.get("phase1_content")
+        )
+        phase2_content = _content_override_for_payload(payload, box_index, "phase2_content") or _content_payload_to_runtime(
+            phase_content.get("phase2_content")
+        )
         states.append(
             {
-                "box_index": int(box.get("box_index", len(states))),
+                "box_index": box_index,
                 "position_label": normalize_text(box.get("position_label")) or f"box {len(states)}",
                 "change_type": normalize_text(box.get("change_type")) or "no_change",
-                "phase1_content": _content_payload_to_runtime(phase_content.get("phase1_content")),
-                "phase2_content": _content_payload_to_runtime(phase_content.get("phase2_content")),
+                "phase1_content": phase1_content,
+                "phase2_content": phase2_content,
                 "container_name": normalize_text(container.get("name")),
                 "container_category": normalize_text(container.get("category")),
                 "container_model": normalize_text(container.get("model")),

@@ -39,6 +39,13 @@ TURN_DEG = 0.6
 DOORLIKE_KEYWORDS = ("door", "doorway")
 DOORLIKE_EXCLUDED_CATEGORIES = ("door", "sliding_door", "doorway")
 COGNITIVEMAP_CAMERA_PITCH_DEG = -10.0
+COUNTING_SCAN_RADIUS_M = 2.0
+COUNTING_SCAN_CAMERA_HEIGHT_M = 1.35
+COUNTING_SCAN_LOOK_HEIGHT_M = 0.75
+UNOBSERVED_PHASE_START_DISTANCE_M = 2.4
+UNOBSERVED_PHASE_END_DISTANCE_M = 0.75
+UNOBSERVED_PHASE_CAMERA_HEIGHT_M = 0.72
+UNOBSERVED_PHASE_LOOK_HEIGHT_M = 0.12
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,8 +62,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=None, help="Optional output width.")
     parser.add_argument("--height", type=int, default=None, help="Optional output height.")
     parser.add_argument("--robot", default="R1")
-    parser.add_argument("--full-scene", action="store_true", help="Load full scene instead of a single room.")
-    parser.add_argument("--room-only", action="store_true", help="Ignore a task module's FULL_SCENE default and load only --room / metadata room.")
+    parser.add_argument("--full-scene", action="store_true", help="Load full scene. This is the default unless --room-only is passed.")
+    parser.add_argument("--room-only", action="store_true", help="Load only --room / metadata room instead of the default full scene.")
     parser.add_argument("--hide-ceilings", action="store_true", help="Do not load ceilings.")
     parser.add_argument("--hide-walls", action="store_true", help="Do not load walls.")
     parser.add_argument("--keep-doors-closed", action="store_true", help="Keep articulated doors in their dataset/default state.")
@@ -771,14 +778,43 @@ def counting_scan_pose(
         return target_orbit_pose(pos, quat, pos + np.array([0.0, 1.0, 0.0]), frame, total_frames, args)
     third = max(total_frames // 3, 1)
     if frame < third:
-        return approach_box_pose(pos, quat, target + np.array([0.0, 0.0, 0.15]), frame, third, args)
+        start_distance = max(float(np.linalg.norm(pos[:2] - target[:2])), COUNTING_SCAN_RADIUS_M)
+        start_height = max(float(pos[2] - target[2]), COUNTING_SCAN_CAMERA_HEIGHT_M)
+        return approach_target_pose(
+            pos,
+            quat,
+            target,
+            frame,
+            third,
+            args,
+            start_distance=start_distance,
+            end_distance=COUNTING_SCAN_RADIUS_M,
+            start_height=start_height,
+            end_height=COUNTING_SCAN_CAMERA_HEIGHT_M,
+            look_height=COUNTING_SCAN_LOOK_HEIGHT_M,
+        )
     local_frame = frame - third
     orbit_frames = max(total_frames - third, 1)
     local_args = argparse.Namespace(**vars(args))
     local_args.orbit_deg = min(max(float(args.orbit_deg), 160.0), 220.0)
-    local_args.target_radius = args.target_radius if args.target_radius is not None else 1.1
-    local_args.target_look_height = max(float(args.target_look_height), 0.22)
-    approach_pos, approach_quat = approach_box_pose(pos, quat, target + np.array([0.0, 0.0, 0.15]), third - 1, third, args)
+    local_args.target_radius = args.target_radius if args.target_radius is not None else COUNTING_SCAN_RADIUS_M
+    local_args.target_height = args.target_height if args.target_height is not None else COUNTING_SCAN_CAMERA_HEIGHT_M
+    local_args.target_look_height = max(float(args.target_look_height), COUNTING_SCAN_LOOK_HEIGHT_M)
+    start_distance = max(float(np.linalg.norm(pos[:2] - target[:2])), COUNTING_SCAN_RADIUS_M)
+    start_height = max(float(pos[2] - target[2]), COUNTING_SCAN_CAMERA_HEIGHT_M)
+    approach_pos, approach_quat = approach_target_pose(
+        pos,
+        quat,
+        target,
+        third - 1,
+        third,
+        args,
+        start_distance=start_distance,
+        end_distance=COUNTING_SCAN_RADIUS_M,
+        start_height=start_height,
+        end_height=COUNTING_SCAN_CAMERA_HEIGHT_M,
+        look_height=COUNTING_SCAN_LOOK_HEIGHT_M,
+    )
     return target_orbit_pose(approach_pos, approach_quat, target, local_frame, orbit_frames, local_args)
 
 
@@ -972,6 +1008,7 @@ def unobserved_phases_frame(
     active_frame = min(phase_frame, active_total - 1)
     offset = start_pos[:2] - target[:2]
     angle = math.atan2(float(offset[1]), float(offset[0])) if np.linalg.norm(offset) > 1e-6 else math.radians(210.0)
+    camera_height = max(float(args.approach_height), UNOBSERVED_PHASE_CAMERA_HEIGHT_M)
     return approach_target_pose(
         start_pos,
         quat,
@@ -979,12 +1016,12 @@ def unobserved_phases_frame(
         active_frame,
         active_total,
         args,
-        start_distance=max(float(np.linalg.norm(offset)), 2.4),
-        end_distance=max(float(args.approach_distance), 0.65),
-        start_height=max(float(start_pos[2] - target[2]), 1.15),
-        end_height=max(float(args.approach_height), 0.58),
+        start_distance=max(float(np.linalg.norm(offset)), UNOBSERVED_PHASE_START_DISTANCE_M),
+        end_distance=max(float(args.approach_distance), UNOBSERVED_PHASE_END_DISTANCE_M),
+        start_height=camera_height,
+        end_height=camera_height,
         angle=angle,
-        look_height=0.08,
+        look_height=UNOBSERVED_PHASE_LOOK_HEIGHT_M,
     )
 
 
@@ -1191,7 +1228,7 @@ def main() -> int:
         raise ValueError("Pass --scene or --metadata containing a scene field.")
 
     objects = task_module.build_env_objects(payload) if payload is not None and task_module is not None else []
-    full_scene = bool(args.full_scene or (getattr(task_module, "FULL_SCENE", False) and not args.room_only))
+    full_scene = bool(args.full_scene or not args.room_only)
     config = build_env_config(scene, room, args.robot, objects, full_scene=full_scene, args=args)
 
     env = None

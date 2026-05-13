@@ -13,6 +13,11 @@ import torch as th
 TASK_NAME = "counting"
 DEFAULT_MODEL = "gemini-2.5-flash"
 SOFTACC_K = 3
+ASSETS_ROOT = Path("/home/yininghong/BEHAVIOR-1K/datasets/behavior-1k-assets/objects")
+TARGET_MESH_OVERRIDES = {
+    # This qualitative counting reference render uses the ink bottle mesh for this semantic target.
+    ("boxed_ink_cartridge", "hidden_by_others/q_001", "grocery_store_cafe", "dining_room_0"): ("ink_bottle", "gcyvrx"),
+}
 
 ACTION_RESPONSE_SCHEMA = {
     "type": "object",
@@ -49,15 +54,32 @@ def existing_model_for_category(category: str, preferred_model: str = "") -> str
     preferred_model = normalize_text(preferred_model)
     if not category:
         return preferred_model
-    assets_root = Path("/home/yininghong/BEHAVIOR-1K/datasets/behavior-1k-assets/objects")
-    category_root = assets_root / category
-    if preferred_model and (category_root / preferred_model / "usd" / f"{preferred_model}.usdz.encrypted").exists():
+    category_root = ASSETS_ROOT / category
+    if model_exists_for_category(category, preferred_model):
         return preferred_model
     if category_root.exists():
         for model_dir in sorted(category_root.iterdir()):
-            if model_dir.is_dir() and (model_dir / "usd" / f"{model_dir.name}.usdz.encrypted").exists():
+            if model_exists_for_category(category, model_dir.name):
                 return model_dir.name
     return preferred_model
+
+
+def model_exists_for_category(category: str, model: str) -> bool:
+    category = normalize_text(category)
+    model = normalize_text(model)
+    if not category or not model:
+        return False
+    return (ASSETS_ROOT / category / model / "usd" / f"{model}.usdz.encrypted").exists()
+
+
+def target_mesh_override_for_payload(payload: dict[str, Any], semantic_target_category: str) -> tuple[str, str] | None:
+    key = (
+        semantic_target_category,
+        normalize_text(payload.get("question_id")),
+        normalize_text(payload.get("scene")),
+        normalize_text(payload.get("room")),
+    )
+    return TARGET_MESH_OVERRIDES.get(key)
 
 
 def normalize_count_answer(value: Any, allow_not_sure: bool = True) -> str:
@@ -226,6 +248,7 @@ def build_env_objects(payload: dict[str, Any]) -> list[dict[str, Any]]:
     question_data = payload.get("question_data", {})
     count_object = question_data.get("count_object") or {}
     semantic_target_category = normalize_text(question_data.get("count_target") or count_object.get("category"))
+    target_mesh_override = target_mesh_override_for_payload(payload, semantic_target_category)
     for group_name in ("containers", "confusers", "targets"):
         for item in resolved.get(group_name, []) or []:
             name = normalize_text(item.get("name"))
@@ -236,11 +259,15 @@ def build_env_objects(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 and semantic_target_category
                 and normalize_text(item.get("role")) == "count_target"
             ):
-                name_category = normalize_text(item.get("category"))
-                if name_category and name_category in name:
-                    name = name.replace(name_category, semantic_target_category)
-                category = semantic_target_category
-                model = existing_model_for_category(category, model)
+                override = target_mesh_override
+                if override is not None and model_exists_for_category(override[0], override[1]):
+                    category, model = override
+                else:
+                    name_category = normalize_text(item.get("category"))
+                    if name_category and name_category in name:
+                        name = name.replace(name_category, semantic_target_category)
+                    category = semantic_target_category
+                    model = existing_model_for_category(category, model)
             position = item.get("position") or item.get("requested_position")
             if not name or not category or not model or position is None:
                 continue
