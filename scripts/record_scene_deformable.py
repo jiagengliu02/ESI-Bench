@@ -1414,7 +1414,7 @@ def main() -> int:
             pos, quat = initial_camera(payload, task_module, args)
             log("task setup complete")
 
-        target, target_source = target_from_payload(payload, args)
+        # target, target_source = target_from_payload(payload, args)
         # demo_state = prepare_task_demo(env, task_module, payload, task_state, args)
         if args.motion in {"target-orbit", "counting-scan"}:
             if target is None:
