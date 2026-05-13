@@ -782,60 +782,7 @@ def counting_scan_pose(
     return target_orbit_pose(approach_pos, approach_quat, target, local_frame, orbit_frames, local_args)
 
 
-def draw_cognitivemap_overlay(rgb: np.ndarray, state: dict[str, Any], frame: int, total_frames: int) -> np.ndarray:
-    path = state.get("path_points")
-    if path is None:
-        return rgb
-    path = np.array(path, dtype=float)
-    if len(path) < 2:
-        return rgb
-
-    image = rgb.copy()
-    height, width = image.shape[:2]
-    box_w = min(max(width // 4, 220), 360)
-    box_h = min(max(height // 5, 150), 240)
-    margin = 22
-    x0 = margin
-    y0 = height - box_h - margin
-
-    overlay = image.copy()
-    cv2.rectangle(overlay, (x0, y0), (x0 + box_w, y0 + box_h), (18, 22, 28), -1)
-    cv2.addWeighted(overlay, 0.72, image, 0.28, 0.0, image)
-    cv2.rectangle(image, (x0, y0), (x0 + box_w, y0 + box_h), (215, 220, 226), 1)
-
-    xy = path[:, :2]
-    lo = xy.min(axis=0)
-    hi = xy.max(axis=0)
-    span = np.maximum(hi - lo, 1e-6)
-    pad = 20
-    scale = min((box_w - pad * 2) / span[0], (box_h - pad * 2) / span[1])
-    center = (lo + hi) * 0.5
-
-    def to_px(point: np.ndarray) -> tuple[int, int]:
-        rel = (point[:2] - center) * scale
-        return int(x0 + box_w * 0.5 + rel[0]), int(y0 + box_h * 0.5 - rel[1])
-
-    poly = np.array([to_px(point) for point in path], dtype=np.int32)
-    cv2.polylines(image, [poly], False, (235, 239, 244), 3, lineType=cv2.LINE_AA)
-
-    progress = frame / float(max(total_frames - 1, 1))
-    completed_count = max(2, min(int(round(progress * (len(poly) - 1))) + 1, len(poly)))
-    cv2.polylines(image, [poly[:completed_count]], False, (255, 197, 82), 4, lineType=cv2.LINE_AA)
-
-    current_index = min(int(round(progress * (len(poly) - 1))), len(poly) - 1)
-    current = tuple(int(v) for v in poly[current_index])
-    start = tuple(int(v) for v in poly[0])
-    dest = tuple(int(v) for v in poly[-1])
-    cv2.circle(image, start, 6, (87, 211, 126), -1, lineType=cv2.LINE_AA)
-    cv2.circle(image, dest, 6, (255, 105, 105), -1, lineType=cv2.LINE_AA)
-    cv2.circle(image, current, 7, (89, 193, 255), -1, lineType=cv2.LINE_AA)
-    cv2.circle(image, current, 10, (255, 255, 255), 1, lineType=cv2.LINE_AA)
-    return image
-
-
 def annotate_frame(rgb: np.ndarray, args: argparse.Namespace, demo_state: dict[str, Any], frame: int, total_frames: int) -> np.ndarray:
-    if args.motion == "cognitivemap-path":
-        return draw_cognitivemap_overlay(rgb, demo_state, frame, total_frames)
     return rgb
 
 

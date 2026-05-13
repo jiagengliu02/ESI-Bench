@@ -20,13 +20,7 @@ All videos are rendered into the isolated directory `outputs/qualitative_task_de
 ## Deformable / cover / bottle under cloth
 
 ```bash
-python scripts/record_scene_video.py \
-  --task deformable \
-  --metadata "json-tmp/deformable/cover_small_item_cloth/Ihlen_1_int/bedroom_1/q_001.json" \
-  --output outputs/qualitative_task_demo/videos/deformable_unveil_bottle_Ihlen_1_int_bedroom_1_q001.mp4 \
-  --motion task-demo \
-  --frames 300 \
-  --fps 30
+python scripts/deforable_camera.py
 ```
 
 ## Mirror / mirror_correspondence
