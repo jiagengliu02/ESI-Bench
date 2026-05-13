@@ -5,6 +5,7 @@ import inspect
 import json
 import math
 import os
+import random
 import re
 import sys
 import time
@@ -21,13 +22,22 @@ os.environ.setdefault("OG_DISABLE_EMITTER_APIS", "1")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ACTIVE_EXPLORE_DIR = REPO_ROOT / "src" / "active_explore"
+TASK_DEFORMABLE_DIR = REPO_ROOT / "src" / "dataset_generation" / "task_deformable"
+TASK_MIRROR_DIR = REPO_ROOT / "src" / "dataset_generation" / "task_mirror"
 sys.path.insert(0, str(ACTIVE_EXPLORE_DIR))
+sys.path.insert(0, str(TASK_DEFORMABLE_DIR))
+sys.path.insert(0, str(TASK_MIRROR_DIR))
 
 import omnigibson as og  # noqa: E402
 import omnigibson.utils.transform_utils as T  # noqa: E402
 from omnigibson.macros import gm  # noqa: E402
+from omnigibson.objects.dataset_object import DatasetObject  # noqa: E402
 from omnigibson.sensors.vision_sensor import VisionSensor  # noqa: E402
+from omnigibson.utils.constants import PrimType  # noqa: E402
 from scipy.spatial.transform import Rotation  # noqa: E402
+
+import batch_deformable as batch  # noqa: E402
+import batch_mirror_distance as scene_utils  # noqa: E402
 
 
 gm.ENABLE_FLATCACHE = False
@@ -44,6 +54,10 @@ COGNITIVEMAP_CAMERA_PITCH_DEG = -10.0
 VIEWER_FRAME_RENDER_STEPS = 12
 VIEWER_FRAME_MAX_RETRIES = 3
 VIEWER_FRAME_RETRY_SLEEP_SEC = 0.15
+DEFAULT_SMALL_ITEM_CATEGORY = "can_of_tomato_paste"
+DEFAULT_SMALL_ITEM_MODEL = "sqqdzb"
+DEFAULT_CLOTH_CATEGORY = "dishtowel"
+DEFAULT_CLOTH_MODEL = "ltydgg"
 
 
 def parse_args() -> argparse.Namespace:
@@ -1370,57 +1384,276 @@ def main() -> int:
     if not scene:
         raise ValueError("Pass --scene or --metadata containing a scene field.")
 
-    objects = task_module.build_env_objects(payload) if payload is not None and task_module is not None else []
     full_scene = bool(args.full_scene or (getattr(task_module, "FULL_SCENE", False) and not args.room_only))
-    config = build_env_config(scene, room, args.robot, objects, full_scene=full_scene, args=args)
 
     env = None
     capture_camera = None
     try:
         log(f"loading scene={scene} room={room} full_scene={full_scene}")
-        env = og.Environment(configs=config)
+        runtime_config = batch._build_config(scene, args.robot, room_name=None if full_scene else room)
+        env = og.Environment(configs=runtime_config)
+        scene_obj = env.scene
         log("environment loaded")
-        doorlike_summary = remove_scene_doorlike_objects(env)
-        log(
-            "removed doorlike objects="
-            f"{len(doorlike_summary['removed'])}/{doorlike_summary['target_total']} "
-            f"failed={len(doorlike_summary['failed'])}"
+
+        seed = int((payload or {}).get("seed", 0) or batch._stable_seed(scene, room, args.question_index))
+        rng = random.Random(seed)
+        room_name = None if full_scene else room
+        floor_name = normalize_text((payload or {}).get("floor_name")) or None
+
+        runtime_steps_src = ((payload or {}).get("camera_setup") or {}).get("runtime_steps") or {}
+        scene_warmup_steps = int(runtime_steps_src.get("scene_warmup_steps", 20) or 20)
+        item_add_steps = int(runtime_steps_src.get("item_add_steps", 12) or 12)
+        item_settle_steps = int(runtime_steps_src.get("item_settle_steps", 30) or 30)
+        post_item_freeze_steps = int(runtime_steps_src.get("post_item_freeze_steps", 4) or 4)
+        cloth_add_steps = int(runtime_steps_src.get("cloth_add_steps", 16) or 16)
+        cloth_settle_steps = int(runtime_steps_src.get("cloth_settle_steps", 40) or 40)
+
+        item_spec = {
+            "category": DEFAULT_SMALL_ITEM_CATEGORY,
+            "model": DEFAULT_SMALL_ITEM_MODEL,
+        }
+        cloth_spec = {
+            "category": DEFAULT_CLOTH_CATEGORY,
+            "model": DEFAULT_CLOTH_MODEL,
+            "mass_kg": float(batch.DEFAULT_CLOTH_MASS_KG),
+            "group": "manual_default",
+        }
+
+        batch._configure_sim_for_cloth_drop()
+        scene_utils._set_viewer_camera_fov(batch.DEFAULT_CAMERA_FOV_DEG)
+        scene_utils._step_sim(scene_warmup_steps)
+        log(f"settled scene for {scene_warmup_steps} steps")
+
+        room_objects = scene_utils._collect_room_objects(scene_obj, room_name)
+        floor_record = scene_utils._select_floor(
+            room_objects,
+            floor_name,
+            agent_pos=(0.0, 0.0, 0.0),
+            room_name=room_name,
         )
-        if not args.keep_doors_closed:
-            opened = open_scene_doors(env)
-            log(f"opened doors={opened}")
-        for _ in range(max(args.settle_steps, 0)):
-            og.sim.step()
-        log(f"settled {max(args.settle_steps, 0)} steps")
+        room_bbox_world_xy, resolved_room_instance = scene_utils._resolve_room_bbox_world_xy(
+            scene_obj,
+            room_name,
+            floor_record,
+        )
+        blockers = [
+            record for record in room_objects if scene_utils._is_floor_blocker(record, floor_record.bbox_max[2])
+        ]
 
-        pos, quat = initial_camera(payload, task_module, args)
-        camera_info = {"camera_pose": {"position": pos.tolist(), "quaternion_xyzw": quat.tolist()}}
-        if payload is not None and task_module is not None and not args.no_task_setup and hasattr(task_module, "postprocess_env"):
-            log(f"running task setup for task={args.task}")
-            task_state = {
-                "source_json": str(question_json) if question_json is not None else "",
-                "step_image_root": str((REPO_ROOT / "outputs" / "steps").resolve()),
-            }
-            setup_result = call_with_supported_args(task_module.postprocess_env, env, payload, camera_info, task_state=task_state)
-            if isinstance(setup_result, dict):
-                task_state.update(setup_result)
-            doorlike_summary = remove_scene_doorlike_objects(env)
-            if doorlike_summary["target_total"]:
-                log(
-                    "removed task doorlike objects="
-                    f"{len(doorlike_summary['removed'])}/{doorlike_summary['target_total']} "
-                    f"failed={len(doorlike_summary['failed'])}"
-                )
-            pos, quat = initial_camera(payload, task_module, args)
-            log("task setup complete")
+        trav_map = None
+        trav_map_img = None
+        try:
+            trav_map, trav_map_img = scene_utils._trav_map_floor_image(scene_obj, floor_idx=0, scene_name=scene)
+        except Exception as exc:
+            log(
+                "failed to load traversability map, fallback to bbox/grid placement: "
+                f"{exc.__class__.__name__}: {exc}"
+            )
 
-        # target, target_source = target_from_payload(payload, args)
-        # demo_state = prepare_task_demo(env, task_module, payload, task_state, args)
-        if args.motion in {"target-orbit", "counting-scan"}:
-            if target is None:
-                log(f"{args.motion} could not infer a target; falling back to camera-relative orbit")
-            else:
-                log(f"{args.motion} target_source={target_source} target={target.round(4).tolist()}")
+        if room_bbox_world_xy is not None:
+            preferred_center_xy = scene_utils._room_bbox_center_xy(room_bbox_world_xy)
+        else:
+            preferred_center_xy = th.tensor(
+                [float(floor_record.center[0]), float(floor_record.center[1])],
+                dtype=th.float32,
+            )
+
+        item_xy = batch._sample_free_position(
+            rng=rng,
+            floor_record=floor_record,
+            blockers=blockers,
+            preferred_center_xy=preferred_center_xy,
+            room_bbox_world_xy=room_bbox_world_xy,
+            trav_map=trav_map,
+            trav_map_img=trav_map_img,
+            clearance_m=batch.DEFAULT_ITEM_FREE_RADIUS_M,
+        )
+
+        item_name = f"{batch.RENDER_OBJECT_PREFIX}item_{seed:010d}"
+        item_obj = DatasetObject(
+            name=item_name,
+            category=item_spec["category"],
+            model=item_spec["model"],
+        )
+        scene_obj.add_object(item_obj)
+        scene_utils._step_sim(item_add_steps)
+        item_obj.set_position_orientation(
+            position=th.tensor(
+                [
+                    float(item_xy[0]),
+                    float(item_xy[1]),
+                    float(floor_record.bbox_max[2]) + batch.DEFAULT_ITEM_DROP_HEIGHT_M,
+                ],
+                dtype=th.float32,
+            ),
+            orientation=th.tensor([0.0, 0.0, 0.0, 1.0], dtype=th.float32),
+        )
+        scene_utils._step_sim(item_settle_steps)
+        batch._set_velocity_zero(item_obj)
+        scene_utils._step_sim(post_item_freeze_steps)
+        log(
+            f"loaded item {item_spec['category']}/{item_spec['model']} at "
+            f"[{float(item_xy[0]):.4f}, {float(item_xy[1]):.4f}]"
+        )
+
+        cloth_name = f"{batch.RENDER_OBJECT_PREFIX}cloth_{seed:010d}"
+        cloth_obj = DatasetObject(
+            name=cloth_name,
+            category=cloth_spec["category"],
+            model=cloth_spec["model"],
+            prim_type=PrimType.CLOTH,
+            abilities={"cloth": {}},
+            load_config={"default_configuration": "settled"},
+        )
+        scene_obj.add_object(cloth_obj)
+        scene_utils._step_sim(cloth_add_steps)
+        cloth_configuration_used = batch._reset_cloth_to_best_configuration(cloth_obj)
+        try:
+            cloth_obj.root_link.mass = float(cloth_spec["mass_kg"])
+        except Exception:
+            pass
+
+        item_bbox_min, item_bbox_max = scene_utils._read_current_aabb(item_obj)
+        item_center = [
+            float((item_bbox_min[0] + item_bbox_max[0]) * 0.5),
+            float((item_bbox_min[1] + item_bbox_max[1]) * 0.5),
+            float((item_bbox_min[2] + item_bbox_max[2]) * 0.5),
+        ]
+        item_top_z = float(item_bbox_max[2])
+        cloth_drop_pos = [
+            float(item_center[0]),
+            float(item_center[1]),
+            float(item_top_z) + batch.DEFAULT_CLOTH_CLEARANCE_ABOVE_ITEM_M,
+        ]
+        cloth_obj.set_position_orientation(
+            position=th.tensor(cloth_drop_pos, dtype=th.float32),
+            orientation=th.tensor([0.0, 0.0, 0.0, 1.0], dtype=th.float32),
+        )
+        try:
+            cloth_obj.root_link.set_linear_velocity(
+                th.tensor([0.0, 0.0, -float(batch.DEFAULT_CLOTH_DOWNWARD_SPEED_MPS)], dtype=th.float32)
+            )
+        except Exception:
+            batch._set_velocity_zero(cloth_obj)
+        scene_utils._step_sim(cloth_settle_steps)
+        log(
+            f"loaded cloth {cloth_spec['category']}/{cloth_spec['model']} "
+            f"configuration={cloth_configuration_used}"
+        )
+
+        item_bbox_min_after_cover, item_bbox_max_after_cover = scene_utils._read_current_aabb(item_obj)
+        item_center_after_cover = [
+            float((item_bbox_min_after_cover[0] + item_bbox_max_after_cover[0]) * 0.5),
+            float((item_bbox_min_after_cover[1] + item_bbox_max_after_cover[1]) * 0.5),
+            float((item_bbox_min_after_cover[2] + item_bbox_max_after_cover[2]) * 0.5),
+        ]
+        cloth_bbox_min_after_settle, cloth_bbox_max_after_settle = scene_utils._read_current_aabb(cloth_obj)
+        cloth_center_after_settle = [
+            float((cloth_bbox_min_after_settle[0] + cloth_bbox_max_after_settle[0]) * 0.5),
+            float((cloth_bbox_min_after_settle[1] + cloth_bbox_max_after_settle[1]) * 0.5),
+            float((cloth_bbox_min_after_settle[2] + cloth_bbox_max_after_settle[2]) * 0.5),
+        ]
+        cloth_extents_after_settle = [
+            float(cloth_bbox_max_after_settle[0] - cloth_bbox_min_after_settle[0]),
+            float(cloth_bbox_max_after_settle[1] - cloth_bbox_min_after_settle[1]),
+            float(cloth_bbox_max_after_settle[2] - cloth_bbox_min_after_settle[2]),
+        ]
+        cover_target = [
+            float(cloth_center_after_settle[0]),
+            float(cloth_center_after_settle[1]),
+            float(max(item_center_after_cover[2], cloth_center_after_settle[2])),
+        ]
+        cover_footprint_xy_m = float(max(cloth_extents_after_settle[0], cloth_extents_after_settle[1], 0.05))
+        normalized = min(max((cover_footprint_xy_m - 0.10) / 0.30, 0.0), 1.0)
+        main_distance_m = batch.DEFAULT_MAIN_VIEW_MIN_DISTANCE_M + (
+            batch.DEFAULT_MAIN_VIEW_MAX_DISTANCE_M - batch.DEFAULT_MAIN_VIEW_MIN_DISTANCE_M
+        ) * normalized
+        main_height_offset_m = batch.DEFAULT_MAIN_VIEW_MIN_HEIGHT_OFFSET_M + (
+            batch.DEFAULT_MAIN_VIEW_MAX_HEIGHT_OFFSET_M - batch.DEFAULT_MAIN_VIEW_MIN_HEIGHT_OFFSET_M
+        ) * normalized
+        theta = math.radians(-90.0)
+        main_eye = [
+            float(cover_target[0]) + float(main_distance_m) * math.cos(theta),
+            float(cover_target[1]) + float(main_distance_m) * math.sin(theta),
+            float(cover_target[2]) + float(main_height_offset_m),
+        ]
+        eye = th.tensor([float(v) for v in main_eye], dtype=th.float32)
+        target_t = th.tensor([float(v) for v in cover_target], dtype=th.float32)
+        backward = eye - target_t
+        backward = backward / th.norm(backward)
+        world_up = th.tensor([0.0, 0.0, 1.0], dtype=th.float32)
+        right = th.linalg.cross(world_up, backward)
+        if float(th.norm(right)) < 1e-6:
+            world_up = th.tensor([1.0, 0.0, 0.0], dtype=th.float32)
+            right = th.linalg.cross(world_up, backward)
+        right = right / th.norm(right)
+        up = th.linalg.cross(backward, right)
+        up = up / th.norm(up)
+        rot = th.stack([right, up, backward], dim=1)
+        main_quat = T.mat2quat(rot).to(dtype=th.float32)
+
+        capture_camera = getattr(og.sim, "_viewer_camera", None) or getattr(og.sim, "viewer_camera", None)
+        if capture_camera is not None:
+            try:
+                if not capture_camera.initialized:
+                    capture_camera.initialize()
+            except Exception:
+                pass
+            try:
+                capture_camera.image_height = int(batch.DEFAULT_CAPTURE_HEIGHT)
+            except Exception:
+                pass
+            try:
+                capture_camera.image_width = int(batch.DEFAULT_CAPTURE_WIDTH)
+            except Exception:
+                pass
+            try:
+                capture_camera.initialize_sensors(names=["rgb"])
+            except Exception:
+                pass
+            try:
+                capture_camera.clipping_range = th.tensor([0.01, 100.0], dtype=th.float32)
+            except Exception:
+                pass
+            capture_camera.set_position_orientation(
+                position=th.tensor([float(v) for v in main_eye], dtype=th.float32),
+                orientation=main_quat,
+            )
+
+        log(
+            f"viewer camera set target={np.round(np.array(cover_target), 4).tolist()} "
+            f"eye={np.round(np.array(main_eye), 4).tolist()}"
+        )
+        print(
+            json.dumps(
+                {
+                    "scene": scene,
+                    "room": room_name,
+                    "resolved_room": resolved_room_instance,
+                    "floor_name": floor_record.name,
+                    "seed": seed,
+                    "small_item": {
+                        **item_spec,
+                        "placement_xy": [round(float(item_xy[0]), 4), round(float(item_xy[1]), 4)],
+                    },
+                    "cloth": {
+                        "category": cloth_spec["category"],
+                        "model": cloth_spec["model"],
+                        "group": cloth_spec.get("group"),
+                        "configuration_used": cloth_configuration_used,
+                        "drop_position": [round(float(v), 4) for v in cloth_drop_pos],
+                    },
+                    "camera_pose": {
+                        "position": [round(float(v), 4) for v in main_eye],
+                        "quaternion_xyzw": [round(float(v), 6) for v in main_quat.detach().cpu().tolist()],
+                        "target_xyz": [round(float(v), 4) for v in cover_target],
+                    },
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
         try:
             while True:
                 try:
