@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import json
 import os
 import random
@@ -18,6 +19,8 @@ for path in (TASK_DEFORMABLE_DIR, TASK_MIRROR_DIR):
         sys.path.insert(0, path_str)
 
 try:
+    import cv2  # noqa: E402
+    import numpy as np  # noqa: E402
     import omnigibson as og  # noqa: E402
     import torch as th  # noqa: E402
     from omnigibson.objects.dataset_object import DatasetObject  # noqa: E402
@@ -41,7 +44,7 @@ DEFAULT_CLOTH_MODEL = "ltydgg"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Load one room, place a small item and a cloth using deformable batch logic, then keep the environment alive."
+        description="Load one room, place a small item and a cloth using deformable batch logic, then record a smooth orbit video."
     )
     parser.add_argument("--scene", required=True, help="Scene model name.")
     parser.add_argument("--room", required=True, help="Room instance name to load.")
@@ -63,6 +66,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cloth-add-steps", type=int, default=None)
     parser.add_argument("--cloth-settle-steps", type=int, default=None)
     parser.add_argument("--capture-render-steps", type=int, default=None)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("outputs/qualitative_task_demo/videos/deformable_test_orbit.mp4"),
+        help="Output mp4 path.",
+    )
+    parser.add_argument("--fps", type=float, default=30.0, help="Output video FPS.")
+    parser.add_argument("--frames", type=int, default=None, help="Override total video frames.")
+    parser.add_argument("--video-seconds", type=float, default=4.0, help="Video length when --frames is not provided.")
+    parser.add_argument("--width", type=int, default=batch.DEFAULT_CAPTURE_WIDTH, help="Output video width.")
+    parser.add_argument("--height", type=int, default=batch.DEFAULT_CAPTURE_HEIGHT, help="Output video height.")
+    parser.add_argument("--keep-alive", action="store_true", help="Keep simulator alive after recording finishes.")
     return parser.parse_args()
 
 
@@ -112,6 +127,129 @@ def _pick_cloth(
 def _set_viewer_camera_pose(position, quat) -> None:
     cam = batch._create_capture_camera(width=batch.DEFAULT_CAPTURE_WIDTH, height=batch.DEFAULT_CAPTURE_HEIGHT)
     batch._set_capture_camera_pose(cam, position, quat)
+
+
+def _render_only(frames: int) -> None:
+    for _ in range(max(int(frames), 0)):
+        try:
+            og.sim.render()
+        except Exception:
+            break
+
+
+def _rgb_obs_to_uint8(frame) -> np.ndarray:
+    if hasattr(frame, "detach"):
+        frame = frame.detach()
+    if hasattr(frame, "cpu"):
+        frame = frame.cpu()
+    image = np.array(frame)
+    if not (image.ndim == 3 and image.shape[2] in (3, 4)):
+        raise ValueError(f"Viewer camera returned invalid rgb shape {getattr(image, 'shape', None)}")
+    image = image[..., :3]
+    if np.issubdtype(image.dtype, np.floating):
+        if image.size and float(np.nanmax(image)) <= 1.0:
+            image = image * 255.0
+        image = np.clip(image, 0, 255).astype(np.uint8)
+    else:
+        image = image.astype(np.uint8)
+    return image
+
+
+def _set_capture_camera_pose_static(cam, position, quat, render_frames: int) -> None:
+    cam.set_position_orientation(
+        position=th.tensor([float(v) for v in position], dtype=th.float32),
+        orientation=th.tensor([float(v) for v in quat], dtype=th.float32),
+    )
+    try:
+        cam.clipping_range = th.tensor([0.01, 100.0], dtype=th.float32)
+    except Exception:
+        pass
+    _render_only(render_frames)
+
+
+def _capture_rgb(cam, render_frames: int) -> np.ndarray:
+    _render_only(render_frames)
+    obs, info = cam.get_obs()
+    if not isinstance(obs, dict):
+        raise RuntimeError(f"get_obs() returned non-dict obs: {type(obs)}")
+    if "rgb" not in obs:
+        raise RuntimeError(f"RGB not found in obs. keys={list(obs.keys())}, info={info}")
+    return _rgb_obs_to_uint8(obs["rgb"])
+
+
+def _make_writer(path: Path, fps: float, width: int, height: int) -> cv2.VideoWriter:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(
+        str(path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (int(width), int(height)),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Could not open video writer for {path}")
+    return writer
+
+
+def _ease_in_out(progress: float) -> float:
+    progress = min(max(float(progress), 0.0), 1.0)
+    return progress * progress * progress * (progress * (progress * 6.0 - 15.0) + 10.0)
+
+
+def _orbit_camera_pose(start_pos, target_xyz, frame_idx: int, total_frames: int):
+    start_pos_np = np.array([float(v) for v in start_pos], dtype=float)
+    target_np = np.array([float(v) for v in target_xyz], dtype=float)
+    progress = 1.0 if total_frames <= 1 else frame_idx / float(total_frames - 1)
+    eased = _ease_in_out(progress)
+
+    relative_xy = start_pos_np[:2] - target_np[:2]
+    radius = float(np.linalg.norm(relative_xy))
+    if radius < 1e-6:
+        relative_xy = np.array([1.0, 0.0], dtype=float)
+        radius = 1.0
+
+    start_angle = math.atan2(float(relative_xy[1]), float(relative_xy[0]))
+    angle = start_angle + math.radians(90.0) * eased
+    end_z = float(target_np[2])
+    z = float(start_pos_np[2]) * (1.0 - eased) + end_z * eased
+
+    position = np.array(
+        [
+            float(target_np[0]) + radius * math.cos(angle),
+            float(target_np[1]) + radius * math.sin(angle),
+            z,
+        ],
+        dtype=float,
+    )
+    quaternion = np.array(batch._look_at_quaternion(position.tolist(), target_np.tolist()), dtype=float)
+    return position, quaternion
+
+
+def _record_orbit_video(args: argparse.Namespace, capture_camera, start_pos, target_xyz) -> dict[str, object]:
+    total_frames = int(args.frames) if args.frames is not None else max(int(round(float(args.video_seconds) * float(args.fps))), 2)
+    render_frames = max(int(args.capture_render_steps), 1)
+    writer = _make_writer(args.output, args.fps, args.width, args.height)
+    end_position = None
+
+    try:
+        for frame_idx in range(total_frames):
+            frame_pos, frame_quat = _orbit_camera_pose(start_pos, target_xyz, frame_idx, total_frames)
+            _set_capture_camera_pose_static(capture_camera, frame_pos, frame_quat, render_frames=render_frames)
+            rgb = _capture_rgb(capture_camera, render_frames=render_frames)
+            if rgb.shape[1] != int(args.width) or rgb.shape[0] != int(args.height):
+                rgb = cv2.resize(rgb, (int(args.width), int(args.height)), interpolation=cv2.INTER_AREA)
+            writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+            end_position = frame_pos
+    finally:
+        writer.release()
+
+    return {
+        "output": str(args.output),
+        "fps": float(args.fps),
+        "frames": total_frames,
+        "start_position": [float(v) for v in start_pos],
+        "end_position": None if end_position is None else [float(v) for v in end_position],
+        "target_xyz": [float(v) for v in target_xyz],
+    }
 
 
 def _load_room_context(scene, scene_name: str, room_name: str, floor_name: str | None, disable_trav_map_check: bool):
@@ -272,6 +410,7 @@ def main() -> None:
     env = None
     item_obj = None
     cloth_obj = None
+    capture_camera = None
     try:
         config = batch._build_config(args.scene, args.robot, room_name=args.room)
         env = og.Environment(configs=config)
@@ -304,8 +443,18 @@ def main() -> None:
         )
         _, item_obj = _spawn_item(scene, floor_record, item_xy, item_spec, seed, args)
         _, cloth_obj, cloth_configuration_used, cloth_drop_pos = _spawn_cloth(scene, item_obj, cloth_spec, seed, args)
+        batch._set_velocity_zero(item_obj)
+        batch._set_velocity_zero(cloth_obj)
         camera_pose = _compute_main_camera(item_obj, cloth_obj)
         _set_viewer_camera_pose(camera_pose["position"], camera_pose["quaternion_xyzw"])
+        capture_camera = batch._create_capture_camera(width=args.width, height=args.height)
+
+        video_info = _record_orbit_video(
+            args,
+            capture_camera=capture_camera,
+            start_pos=camera_pose["position"],
+            target_xyz=camera_pose["target_xyz"],
+        )
 
         summary = {
             "scene": args.scene,
@@ -339,15 +488,18 @@ def main() -> None:
                 "post_item_freeze_steps": int(args.post_item_freeze_steps),
                 "cloth_add_steps": int(args.cloth_add_steps),
                 "cloth_settle_steps": int(args.cloth_settle_steps),
+                "capture_render_steps": int(args.capture_render_steps),
             },
             "room_object_count": len(room_objects),
             "blocker_count": len(blockers),
+            "video": video_info,
         }
         print(json.dumps(summary, indent=2, ensure_ascii=False), flush=True)
-        print("[deformable_test] Setup finished. Simulator stays alive. Press Ctrl+C to exit.", flush=True)
-        while True:
-            og.sim.render()
-            scene_utils._step_sim(1)
+        print(f"[deformable_test] Orbit video saved to {args.output}", flush=True)
+        if args.keep_alive:
+            print("[deformable_test] Recording finished. Simulator stays alive. Press Ctrl+C to exit.", flush=True)
+            while True:
+                _render_only(1)
     except KeyboardInterrupt:
         print("[deformable_test] Exit requested by user (Ctrl+C).", flush=True)
     finally:
